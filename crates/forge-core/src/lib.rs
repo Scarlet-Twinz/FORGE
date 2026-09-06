@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 
 pub type TaskId = u64;
 
@@ -30,6 +31,20 @@ pub enum GraphError {
     MissingDependency { task: TaskId, dependency: TaskId },
     CycleDetected,
 }
+
+impl fmt::Display for GraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateTask(id) => write!(f, "task {id} already exists"),
+            Self::MissingDependency { task, dependency } => {
+                write!(f, "task {task} references missing dependency {dependency}")
+            }
+            Self::CycleDetected => write!(f, "task graph contains a dependency cycle"),
+        }
+    }
+}
+
+impl std::error::Error for GraphError {}
 
 impl TaskGraph {
     pub fn add_task(
