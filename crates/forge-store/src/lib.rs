@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -74,6 +75,80 @@ impl JobStore {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub hash: String,
+    pub size: u64,
+}
+
+#[derive(Debug)]
+pub struct ArtifactStore {
+    root: PathBuf,
+}
+
+impl ArtifactStore {
+    pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(root.join("objects"))?;
+        Ok(Self { root })
+    }
+
+    pub fn put(&self, data: &[u8]) -> io::Result<Artifact> {
+        let hash = sha256_hex(data);
+        let path = self.object_path(&hash);
+
+        if !path.exists() {
+            let temp = path.with_extension("tmp");
+            {
+                let mut file = File::create(&temp)?;
+                file.write_all(data)?;
+                file.sync_all()?;
+            }
+            if let Err(error) = fs::rename(&temp, &path) {
+                let _ = fs::remove_file(&temp);
+                if !path.exists() {
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(Artifact {
+            hash,
+            size: data.len() as u64,
+        })
+    }
+
+    pub fn get(&self, hash: &str) -> io::Result<Option<Vec<u8>>> {
+        if !is_valid_hash(hash) {
+            return Ok(None);
+        }
+
+        let path = self.object_path(hash);
+        match fs::read(path) {
+            Ok(data) => Ok(Some(data)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn contains(&self, hash: &str) -> bool {
+        is_valid_hash(hash) && self.object_path(hash).is_file()
+    }
+
+    fn object_path(&self, hash: &str) -> PathBuf {
+        self.root.join("objects").join(hash)
+    }
+}
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn is_valid_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +165,47 @@ mod tests {
         let store = JobStore::open(&path).unwrap();
         assert_eq!(store.get(7).unwrap().status, "succeeded");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn artifact_store_round_trips_content_by_hash() {
+        let root = std::env::temp_dir().join(format!("forge-artifacts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = ArtifactStore::open(&root).unwrap();
+        let artifact = store.put(b"forge artifact").unwrap();
+
+        assert_eq!(artifact.size, 14);
+        assert_eq!(artifact.hash.len(), 64);
+        assert!(store.contains(&artifact.hash));
+        assert_eq!(store.get(&artifact.hash).unwrap().unwrap(), b"forge artifact");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identical_artifacts_are_deduplicated() {
+        let root = std::env::temp_dir().join(format!("forge-artifacts-dedup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = ArtifactStore::open(&root).unwrap();
+
+        let first = store.put(b"same bytes").unwrap();
+        let second = store.put(b"same bytes").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read_dir(root.join("objects")).unwrap().count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_hashes_are_not_read_as_paths() {
+        let root = std::env::temp_dir().join(format!("forge-artifacts-invalid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = ArtifactStore::open(&root).unwrap();
+
+        assert!(!store.contains("../../outside"));
+        assert!(store.get("../../outside").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 }
