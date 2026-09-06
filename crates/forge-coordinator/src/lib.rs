@@ -63,15 +63,22 @@ impl WorkerClient {
 
     fn connect(&self) -> Result<TcpStream, CoordinatorError> {
         let mut addresses = self.address.to_socket_addrs()?;
-        let address = addresses
-            .next()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "worker address resolved to no endpoints"))?;
+        let address = addresses.next().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "worker address resolved to no endpoints",
+            )
+        })?;
         let stream = TcpStream::connect_timeout(&address, self.connect_timeout)?;
         stream.set_nodelay(true)?;
         Ok(stream)
     }
 
-    pub fn execute(&self, task_id: u64, command: impl Into<String>) -> Result<TaskResult, CoordinatorError> {
+    pub fn execute(
+        &self,
+        task_id: u64,
+        command: impl Into<String>,
+    ) -> Result<TaskResult, CoordinatorError> {
         let mut stream = self.connect()?;
         let request = TaskRequest {
             task_id,
@@ -272,7 +279,8 @@ mod tests {
 
     #[test]
     fn distributed_executor_runs_dependency_order() {
-        let (address, worker_thread) = spawn_worker(Worker::new("graph-worker", 2), 4);
+        // One heartbeat probe + two task executions = three accepted connections.
+        let (address, worker_thread) = spawn_worker(Worker::new("graph-worker", 2), 3);
         let mut graph = TaskGraph::default();
         graph.add_task(1, "echo build", Vec::new()).unwrap();
         graph.add_task(2, "echo test", vec![1]).unwrap();
