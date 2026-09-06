@@ -23,12 +23,14 @@ pub struct Frame {
 pub struct TaskRequest {
     pub task_id: u64,
     pub command: String,
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskResult {
     pub task_id: u64,
     pub success: bool,
+    pub timed_out: bool,
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
@@ -184,6 +186,13 @@ impl TaskRequest {
         let mut payload = Vec::new();
         put_u64(&mut payload, self.task_id);
         put_string(&mut payload, &self.command)?;
+        match self.timeout_ms {
+            Some(timeout) => {
+                payload.push(1);
+                put_u64(&mut payload, timeout);
+            }
+            None => payload.push(0),
+        }
         Ok(payload)
     }
 
@@ -191,8 +200,13 @@ impl TaskRequest {
         let mut offset = 0;
         let task_id = read_u64(payload, &mut offset)?;
         let command = read_string(payload, &mut offset)?;
+        let timeout_ms = match read_exact(payload, &mut offset, 1)?[0] {
+            0 => None,
+            1 => Some(read_u64(payload, &mut offset)?),
+            _ => return Err(ProtocolError::InvalidPayload("invalid timeout flag")),
+        };
         ensure_consumed(payload, offset)?;
-        Ok(Self { task_id, command })
+        Ok(Self { task_id, command, timeout_ms })
     }
 }
 
@@ -201,6 +215,7 @@ impl TaskResult {
         let mut payload = Vec::new();
         put_u64(&mut payload, self.task_id);
         payload.push(u8::from(self.success));
+        payload.push(u8::from(self.timed_out));
         match self.exit_code {
             Some(code) => {
                 payload.push(1);
@@ -221,6 +236,11 @@ impl TaskResult {
             1 => true,
             _ => return Err(ProtocolError::InvalidPayload("invalid success flag")),
         };
+        let timed_out = match read_exact(payload, &mut offset, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(ProtocolError::InvalidPayload("invalid timeout flag")),
+        };
         let exit_code = match read_exact(payload, &mut offset, 1)?[0] {
             0 => None,
             1 => Some(read_i32(payload, &mut offset)?),
@@ -229,7 +249,7 @@ impl TaskResult {
         let stdout = read_string(payload, &mut offset)?;
         let stderr = read_string(payload, &mut offset)?;
         ensure_consumed(payload, offset)?;
-        Ok(Self { task_id, success, exit_code, stdout, stderr })
+        Ok(Self { task_id, success, timed_out, exit_code, stdout, stderr })
     }
 }
 
@@ -256,10 +276,7 @@ mod tests {
 
     #[test]
     fn frame_round_trip() {
-        let frame = Frame {
-            kind: MessageKind::Heartbeat,
-            payload: b"worker-1".to_vec(),
-        };
+        let frame = Frame { kind: MessageKind::Heartbeat, payload: b"worker-1".to_vec() };
         let mut bytes = Vec::new();
         frame.encode(&mut bytes).unwrap();
         let decoded = Frame::decode(&mut bytes.as_slice()).unwrap();
@@ -267,21 +284,22 @@ mod tests {
     }
 
     #[test]
-    fn task_request_round_trip() {
-        let request = TaskRequest { task_id: 42, command: "echo forge".into() };
+    fn task_request_round_trip_with_timeout() {
+        let request = TaskRequest { task_id: 42, command: "echo forge".into(), timeout_ms: Some(1500) };
+        let encoded = request.encode().unwrap();
+        assert_eq!(TaskRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn task_request_round_trip_without_timeout() {
+        let request = TaskRequest { task_id: 42, command: "echo forge".into(), timeout_ms: None };
         let encoded = request.encode().unwrap();
         assert_eq!(TaskRequest::decode(&encoded).unwrap(), request);
     }
 
     #[test]
     fn task_result_round_trip() {
-        let result = TaskResult {
-            task_id: 42,
-            success: false,
-            exit_code: Some(7),
-            stdout: "out".into(),
-            stderr: "err".into(),
-        };
+        let result = TaskResult { task_id: 42, success: false, timed_out: true, exit_code: None, stdout: "out".into(), stderr: "task timed out".into() };
         let encoded = result.encode().unwrap();
         assert_eq!(TaskResult::decode(&encoded).unwrap(), result);
     }
@@ -295,9 +313,6 @@ mod tests {
 
     #[test]
     fn malformed_payload_is_rejected() {
-        assert_eq!(
-            TaskRequest::decode(&[0, 0, 0]).unwrap_err(),
-            ProtocolError::InvalidPayload("truncated payload")
-        );
+        assert_eq!(TaskRequest::decode(&[0, 0, 0]).unwrap_err(), ProtocolError::InvalidPayload("truncated payload"));
     }
 }
