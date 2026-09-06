@@ -1,8 +1,10 @@
 use std::fmt;
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::thread;
 use std::time::Duration;
 
+use forge_core::{TaskGraph, TaskId, TaskState};
 use forge_protocol::{Frame, Heartbeat, MessageKind, TaskRequest, TaskResult};
 
 #[derive(Debug)]
@@ -10,6 +12,8 @@ pub enum CoordinatorError {
     Io(std::io::Error),
     Protocol(Box<dyn std::error::Error>),
     UnexpectedMessage(MessageKind),
+    NoWorkers,
+    SchedulerStalled,
 }
 
 impl fmt::Display for CoordinatorError {
@@ -18,6 +22,8 @@ impl fmt::Display for CoordinatorError {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Protocol(error) => write!(formatter, "protocol error: {error}"),
             Self::UnexpectedMessage(kind) => write!(formatter, "unexpected worker message: {kind:?}"),
+            Self::NoWorkers => write!(formatter, "distributed executor has no workers"),
+            Self::SchedulerStalled => write!(formatter, "distributed scheduler stalled with pending tasks"),
         }
     }
 }
@@ -61,7 +67,6 @@ impl WorkerClient {
 
     pub fn execute(&self, task_id: u64, command: impl Into<String>) -> Result<TaskResult, CoordinatorError> {
         let mut stream = self.connect()?;
-
         let request = TaskRequest {
             task_id,
             command: command.into(),
@@ -81,7 +86,6 @@ impl WorkerClient {
         if response.kind != MessageKind::TaskResult {
             return Err(CoordinatorError::UnexpectedMessage(response.kind));
         }
-
         TaskResult::decode(&response.payload)
             .map_err(|error| CoordinatorError::Protocol(Box::new(error)))
     }
@@ -94,7 +98,6 @@ impl WorkerClient {
         }
         .encode()
         .map_err(|error| CoordinatorError::Protocol(Box::new(error)))?;
-
         Frame {
             kind: MessageKind::Heartbeat,
             payload,
@@ -107,9 +110,87 @@ impl WorkerClient {
         if response.kind != MessageKind::Heartbeat {
             return Err(CoordinatorError::UnexpectedMessage(response.kind));
         }
-
         Heartbeat::decode(&response.payload)
             .map_err(|error| CoordinatorError::Protocol(Box::new(error)))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DistributedExecutor {
+    workers: Vec<WorkerClient>,
+}
+
+impl DistributedExecutor {
+    pub fn new<I, S>(addresses: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            workers: addresses.into_iter().map(WorkerClient::new).collect(),
+        }
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub fn execute(&self, graph: &mut TaskGraph) -> Result<Vec<TaskId>, CoordinatorError> {
+        if self.workers.is_empty() {
+            return Err(CoordinatorError::NoWorkers);
+        }
+
+        let mut completed = Vec::new();
+        let mut worker_index = 0usize;
+
+        loop {
+            graph.reconcile_blocked();
+            let runnable = graph.runnable();
+
+            if runnable.is_empty() {
+                if graph.pending().is_empty() {
+                    return Ok(completed);
+                }
+                return Err(CoordinatorError::SchedulerStalled);
+            }
+
+            let assignments = runnable
+                .into_iter()
+                .map(|task_id| {
+                    let worker = self.workers[worker_index % self.workers.len()].clone();
+                    worker_index += 1;
+                    let command = graph
+                        .task(task_id)
+                        .expect("runnable task must exist")
+                        .command
+                        .clone();
+                    graph.task_mut(task_id).expect("runnable task must exist").state = TaskState::Running;
+                    (task_id, worker, command)
+                })
+                .collect::<Vec<_>>();
+
+            let handles = assignments
+                .into_iter()
+                .map(|(task_id, worker, command)| {
+                    thread::spawn(move || (task_id, worker.execute(task_id, command)))
+                })
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                let (task_id, result) = handle
+                    .join()
+                    .map_err(|_| CoordinatorError::SchedulerStalled)?;
+                match result {
+                    Ok(result) if result.success => {
+                        graph.task_mut(task_id).expect("running task must exist").state = TaskState::Succeeded;
+                        completed.push(task_id);
+                    }
+                    Ok(_) | Err(_) => {
+                        graph.task_mut(task_id).expect("running task must exist").state = TaskState::Failed;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -118,7 +199,6 @@ mod tests {
     use super::*;
     use forge_worker::{handle_connection, Worker};
     use std::net::TcpListener;
-    use std::thread;
 
     fn spawn_worker_once(worker: Worker) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -133,11 +213,9 @@ mod tests {
     #[test]
     fn client_executes_task_on_remote_worker() {
         let (address, worker_thread) = spawn_worker_once(Worker::new("test-worker", 1));
-
         let result = WorkerClient::new(address)
             .execute(42, "echo distributed-forge")
             .unwrap();
-
         assert_eq!(result.task_id, 42);
         assert!(result.success);
         assert!(result.stdout.to_ascii_lowercase().contains("distributed-forge"));
@@ -147,9 +225,7 @@ mod tests {
     #[test]
     fn client_reads_worker_heartbeat() {
         let (address, worker_thread) = spawn_worker_once(Worker::new("heartbeat-worker", 1));
-
         let heartbeat = WorkerClient::new(address).heartbeat().unwrap();
-
         assert_eq!(heartbeat.worker_id, "heartbeat-worker");
         assert!(heartbeat.unix_seconds > 0);
         worker_thread.join().unwrap();
