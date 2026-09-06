@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 pub type TaskId = u64;
@@ -10,6 +10,7 @@ pub enum TaskState {
     Running,
     Succeeded,
     Failed,
+    Blocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +23,7 @@ pub struct Task {
 
 #[derive(Debug, Default)]
 pub struct TaskGraph {
-    tasks: HashMap<TaskId, Task>,
+    tasks: BTreeMap<TaskId, Task>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,38 @@ impl TaskGraph {
                             .is_some_and(|task| task.state == TaskState::Succeeded)
                     })
             })
+            .map(|task| task.id)
+            .collect()
+    }
+
+    pub fn reconcile_blocked(&mut self) -> Vec<TaskId> {
+        let blocked = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.state == TaskState::Pending
+                    && task.dependencies.iter().any(|dependency| {
+                        self.tasks.get(dependency).is_some_and(|dependency| {
+                            matches!(dependency.state, TaskState::Failed | TaskState::Blocked)
+                        })
+                    })
+            })
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+
+        for &task_id in &blocked {
+            if let Some(task) = self.tasks.get_mut(&task_id) {
+                task.state = TaskState::Blocked;
+            }
+        }
+
+        blocked
+    }
+
+    pub fn pending(&self) -> Vec<TaskId> {
+        self.tasks
+            .values()
+            .filter(|task| task.state == TaskState::Pending)
             .map(|task| task.id)
             .collect()
     }
@@ -196,14 +229,30 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_dispatches_ready_work() {
+    fn scheduler_dispatches_ready_work_deterministically() {
         let mut graph = TaskGraph::default();
+        graph.add_task(2, "test", Vec::new()).unwrap();
         graph.add_task(1, "compile", Vec::new()).unwrap();
-        graph.add_task(2, "test", vec![1]).unwrap();
 
         let mut scheduler = Scheduler::default();
         scheduler.refresh(&graph);
         assert_eq!(scheduler.next(), Some(1));
+        assert_eq!(scheduler.next(), Some(2));
         assert_eq!(scheduler.next(), None);
+    }
+
+    #[test]
+    fn failed_dependency_blocks_downstream_work() {
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, "compile", Vec::new()).unwrap();
+        graph.add_task(2, "test", vec![1]).unwrap();
+        graph.add_task(3, "package", vec![2]).unwrap();
+
+        graph.task_mut(1).unwrap().state = TaskState::Failed;
+        assert_eq!(graph.reconcile_blocked(), vec![2]);
+        assert_eq!(graph.task(2).unwrap().state, TaskState::Blocked);
+        assert_eq!(graph.reconcile_blocked(), vec![3]);
+        assert_eq!(graph.task(3).unwrap().state, TaskState::Blocked);
+        assert!(graph.runnable().is_empty());
     }
 }
