@@ -1,0 +1,10 @@
+[package]
+name = "forge-coordinator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+forge-protocol = { path = "../forge-protocol" }
+
+[dev-dependencies]
+forge-worker = { path = "../forge-worker" }
