@@ -69,6 +69,10 @@ impl CachedDistributedExecutor {
             }
         }
 
+        if graph.pending().is_empty() {
+            return Ok(cached);
+        }
+
         let completed = self.executor.execute(graph)?;
 
         for task_id in pending_before {
