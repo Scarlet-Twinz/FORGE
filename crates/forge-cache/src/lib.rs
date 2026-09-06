@@ -1,5 +1,5 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use forge_coordinator::{CoordinatorError, DistributedExecutor};
@@ -11,6 +11,7 @@ pub struct CachedDistributedExecutor {
     executor: DistributedExecutor,
     artifacts: ArtifactStore,
     cache: CacheStore,
+    task_timeout: Option<Duration>,
 }
 
 impl CachedDistributedExecutor {
@@ -26,6 +27,7 @@ impl CachedDistributedExecutor {
             executor: DistributedExecutor::new(addresses),
             artifacts,
             cache,
+            task_timeout: None,
         })
     }
 
@@ -35,6 +37,7 @@ impl CachedDistributedExecutor {
     }
 
     pub fn with_task_timeout(mut self, timeout: Duration) -> Self {
+        self.task_timeout = Some(timeout);
         self.executor = self.executor.with_task_timeout(timeout);
         self
     }
@@ -53,7 +56,7 @@ impl CachedDistributedExecutor {
 
         for task_id in &pending_before {
             let task = graph.task(*task_id).expect("pending task must exist");
-            let key = cache_key(&task.command, self.task_timeout());
+            let key = cache_key(&task.command, self.task_timeout);
             let hit = self
                 .cache
                 .lookup(&key)
@@ -74,7 +77,7 @@ impl CachedDistributedExecutor {
                 continue;
             }
 
-            let key = cache_key(&task.command, self.task_timeout());
+            let key = cache_key(&task.command, self.task_timeout);
             let artifact = self
                 .artifacts
                 .put(task.command.as_bytes())
@@ -89,10 +92,6 @@ impl CachedDistributedExecutor {
         all_completed.sort_unstable();
         all_completed.dedup();
         Ok(all_completed)
-    }
-
-    fn task_timeout(&self) -> Option<Duration> {
-        None
     }
 }
 
@@ -144,10 +143,9 @@ mod tests {
 
         let mut first_graph = TaskGraph::default();
         first_graph.add_task(1, "echo cache-me", Vec::new()).unwrap();
-        let mut first = CachedDistributedExecutor::open([address.clone()], &root).unwrap();
+        let mut first = CachedDistributedExecutor::open([address], &root).unwrap();
         assert_eq!(first.execute(&mut first_graph).unwrap(), vec![1]);
         assert_eq!(first_graph.task(1).unwrap().state, TaskState::Succeeded);
-
         worker_thread.join().unwrap();
 
         let mut second_graph = TaskGraph::default();
