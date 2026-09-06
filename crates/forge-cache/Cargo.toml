@@ -7,3 +7,6 @@ edition = "2021"
 forge-core = { path = "../forge-core" }
 forge-coordinator = { path = "../forge-coordinator" }
 forge-store = { path = "../forge-store" }
+
+[dev-dependencies]
+forge-worker = { path = "../forge-worker" }
