@@ -61,6 +61,9 @@ impl JobStore {
             file.sync_all()?;
         }
 
+        if self.path.exists() {
+            fs::remove_file(&self.path)?;
+        }
         fs::rename(temp, &self.path)
     }
 
@@ -76,11 +79,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_survive_reopen() {
+    fn records_survive_reopen_and_upsert() {
         let path = std::env::temp_dir().join(format!("forge-store-{}.db", std::process::id()));
         let _ = fs::remove_file(&path);
         {
             let mut store = JobStore::open(&path).unwrap();
+            store.upsert(JobRecord { job_id: 7, status: "running".into() }).unwrap();
             store.upsert(JobRecord { job_id: 7, status: "succeeded".into() }).unwrap();
         }
         let store = JobStore::open(&path).unwrap();
