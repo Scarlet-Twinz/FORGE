@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,7 +37,10 @@ impl ConcurrencyGate {
     }
 
     fn acquire(self: &Arc<Self>) -> ConcurrencyPermit {
-        let mut active = self.state.lock().expect("worker concurrency mutex poisoned");
+        let mut active = self
+            .state
+            .lock()
+            .expect("worker concurrency mutex poisoned");
         while *active >= self.limit {
             active = self
                 .changed
@@ -58,7 +61,11 @@ struct ConcurrencyPermit {
 
 impl Drop for ConcurrencyPermit {
     fn drop(&mut self) {
-        let mut active = self.gate.state.lock().expect("worker concurrency mutex poisoned");
+        let mut active = self
+            .gate
+            .state
+            .lock()
+            .expect("worker concurrency mutex poisoned");
         *active -= 1;
         self.gate.changed.notify_one();
     }
@@ -106,7 +113,7 @@ impl Worker {
                 }
 
                 if started.elapsed() >= timeout {
-                    child.kill()?;
+                    terminate_process_tree(&mut child)?;
                     let output = child.wait_with_output()?;
                     return Ok(TaskResult {
                         success: false,
@@ -151,6 +158,20 @@ fn timeout_stderr(stderr: &[u8]) -> String {
     } else {
         format!("task timed out: {existing}")
     }
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+    let pid = child.id().to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid, "/T", "/F"])
+        .output()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
 }
 
 pub fn handle_connection(
