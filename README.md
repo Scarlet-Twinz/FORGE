@@ -2,7 +2,7 @@
 
 A systems-oriented distributed build and task execution engine.
 
-FORGE accepts a dependency-aware workload, schedules executable tasks, coordinates workers, persists execution state, and records deterministic results. The project is designed as an infrastructure system rather than a dashboard application.
+FORGE models dependency-aware workloads, schedules executable tasks, coordinates workers over a framed TCP protocol, persists execution state, and records deterministic results. The project is designed as infrastructure rather than a conventional web application.
 
 ## Architecture
 
@@ -17,55 +17,58 @@ Client / CLI
      |
      v
  Scheduler
-   / | \
-  v  v  v
- W1 W2 W3
-  \  |  /
-   \ | /
-    Results
-      |
-      v
- Artifact / Cache Store
+     |
+     +-------------------+
+     |                   |
+     v                   v
+Worker A              Worker B
+     |                   |
+     +---------+---------+
+               |
+               v
+         Results / Store
+               |
+               v
+        Artifact / Cache
 ```
 
-## Core Components
+## Current Implementation
 
-- **Job graph** — dependency-aware task representation.
-- **Scheduler** — selects runnable work and tracks execution state.
-- **Workers** — execute isolated tasks and report results.
-- **Persistence** — preserves job and task state across process restarts.
-- **Artifact store** — records build outputs and reusable results.
-- **Cache** — avoids repeating deterministic work.
-- **Transport** — worker/client communication over a defined network protocol.
-- **Fault handling** — retries, timeouts, and worker failure detection.
-- **Observability** — structured logs, metrics, and execution statistics.
-- **CLI** — submit workloads and inspect execution results without requiring a web UI.
+- **Task graph** — dependency-aware tasks with deterministic ordering and blocked-dependency propagation.
+- **Scheduler** — deterministic runnable-task dispatch.
+- **Worker runtime** — executes tasks as isolated child processes.
+- **Wire protocol** — versioned binary frames with structured task requests, task results, and heartbeats.
+- **TCP worker service** — workers can receive task requests from a coordinator over localhost/network TCP.
+- **Coordinator client** — submits a task to a remote worker and validates the returned result.
+- **Persistence** — atomic file-backed job records that survive process reopen.
+- **CLI** — local execution path plus a coordinator executable for remote worker execution.
 
-## Engineering Goals
+## Engineering Direction
 
-FORGE is intentionally built from the execution layer upward. The implementation prioritizes correctness, concurrency, deterministic behavior, failure handling, and measurable performance.
+The system is built from the execution layer upward. Correctness, deterministic scheduling, explicit state transitions, protocol validation, process isolation, and failure handling take priority over presentation.
 
-The initial implementation will establish a complete single-process execution engine before distributed worker coordination is introduced. Each layer is independently testable so the final system is not dependent on unfinished infrastructure.
+The distributed layer is being introduced incrementally: local execution is already exercised by the CLI, while worker/coordinator communication is now covered by a real TCP protocol path and an integration test. More advanced scheduling, retries, worker health tracking, artifact caching, and fault-injection tests will be added only when implemented and validated.
 
-## Planned Repository Structure
+## Repository Structure
 
 ```text
 forge/
 ├── crates/
-│   ├── forge-core/       # Task graph, scheduler, state machine
-│   ├── forge-worker/     # Worker execution runtime
-│   ├── forge-protocol/   # Client/worker wire protocol
-│   ├── forge-store/      # Persistence and artifact storage
-│   └── forge-cli/        # Command-line interface
-├── tests/                # Integration and fault tests
-├── benches/              # Performance benchmarks
-├── docs/                 # Architecture and protocol notes
+│   ├── forge-core/        # Task graph, scheduler, state machine
+│   ├── forge-worker/      # Worker execution runtime + TCP service
+│   ├── forge-protocol/    # Versioned client/worker wire protocol
+│   ├── forge-store/       # Persistent job state
+│   ├── forge-coordinator/ # Remote worker client
+│   └── forge-cli/         # Local execution CLI
+├── tests/                 # Integration and fault tests
+├── benches/               # Performance benchmarks
+├── docs/                  # Architecture and protocol notes
 └── README.md
 ```
 
 ## Status
 
-The repository has been initialized for implementation. Source modules will be added incrementally with tests and validation at each layer.
+Core scheduling, local execution, persistence, and the first coordinator-to-worker TCP execution path are implemented. The project remains intentionally focused on infrastructure depth rather than a web frontend.
 
 ## License
 
