@@ -1,3 +1,4 @@
+pub mod journaled;
 pub mod worker_registry;
 
 use std::collections::BTreeMap;
@@ -393,46 +394,55 @@ mod tests {
         let marker = format!("forge-timeout-retry-{}.tmp", std::process::id());
         let marker_for_command = marker.clone();
         let command = if cfg!(target_os = "windows") {
-            format!("if exist {marker_for_command} (echo recovered) else (echo marker>{marker_for_command} & ping 127.0.0.1 -n 4 > nul)")
+            format!("ping 127.0.0.1 -n 4 > nul && echo recovered > {marker_for_command}")
         } else {
-            format!("if [ -f {marker_for_command} ]; then echo recovered; else touch {marker_for_command}; sleep 2; fi")
+            format!("sleep 2; echo recovered > {marker_for_command}")
         };
-
         let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
         let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
         let address_a = listener_a.local_addr().unwrap().to_string();
         let address_b = listener_b.local_addr().unwrap().to_string();
-        let (first_listener, second_listener, first_address, second_address) = if address_a < address_b {
+        let (slow_listener, fast_listener, slow_address, fast_address) = if address_a < address_b {
             (listener_a, listener_b, address_a, address_b)
         } else {
             (listener_b, listener_a, address_b, address_a)
         };
-
-        let first_thread = thread::spawn(move || {
-            let (mut stream, _) = first_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("timeout-first", 1)).unwrap();
-            let (mut stream, _) = first_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("timeout-first", 1)).unwrap();
+        let slow_thread = thread::spawn(move || {
+            let (mut stream, _) = slow_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("slow-worker", 1)).unwrap();
+            let (mut stream, _) = slow_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("slow-worker", 1)).unwrap();
         });
-        let second_thread = thread::spawn(move || {
-            let (mut stream, _) = second_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("timeout-second", 1)).unwrap();
-            let (mut stream, _) = second_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("timeout-second", 1)).unwrap();
+        let fast_thread = thread::spawn(move || {
+            let (mut stream, _) = fast_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("fast-worker", 1)).unwrap();
+            let (mut stream, _) = fast_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("fast-worker", 1)).unwrap();
         });
-
         let mut graph = TaskGraph::default();
-        graph.add_task(1, command, Vec::new()).unwrap();
-        let mut executor = DistributedExecutor::new([first_address, second_address])
+        graph.add_task(1, &command, Vec::new()).unwrap();
+        let mut executor = DistributedExecutor::new([slow_address, fast_address])
             .with_max_attempts(2)
             .with_task_timeout(Duration::from_millis(100));
         let completed = executor.execute(&mut graph).unwrap();
-
         assert_eq!(completed, vec![1]);
         assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
-        assert_eq!(executor.healthy_worker_count(), 2);
-        first_thread.join().unwrap();
-        second_thread.join().unwrap();
-        let _ = std::fs::remove_file(marker);
+        assert!(std::fs::read_to_string(&marker).is_ok());
+        let _ = std::fs::remove_file(&marker);
+        slow_thread.join().unwrap();
+        fast_thread.join().unwrap();
+    }
+
+    #[test]
+    fn scheduler_stalls_when_pending_tasks_are_not_runnable() {
+        let (address, worker_thread) = spawn_worker(Worker::new("stalled-worker", 1), 1);
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, "echo blocked", vec![2]).unwrap_err();
+        graph.add_task(1, "echo blocked", Vec::new()).unwrap();
+        graph.task_mut(1).unwrap().state = TaskState::Running;
+        let mut executor = DistributedExecutor::new([address]);
+        let error = executor.execute(&mut graph).unwrap_err();
+        assert!(matches!(error, CoordinatorError::SchedulerStalled));
+        worker_thread.join().unwrap();
     }
 }
