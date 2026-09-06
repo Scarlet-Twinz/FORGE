@@ -112,6 +112,12 @@ impl WorkerRegistry {
         results
     }
 
+    pub fn mark_unhealthy(&mut self, address: &str) {
+        if let Some(record) = self.workers.get_mut(address) {
+            record.health = WorkerHealth::Unhealthy;
+        }
+    }
+
     pub fn refresh_health(&mut self) {
         let now = Instant::now();
         for record in self.workers.values_mut() {
@@ -167,6 +173,18 @@ mod tests {
         record.last_seen = Some(Instant::now() - Duration::from_secs(1));
 
         registry.refresh_health();
+        assert!(registry.healthy_workers().is_empty());
+    }
+
+    #[test]
+    fn mark_unhealthy_removes_worker_from_healthy_set() {
+        let mut registry = WorkerRegistry::new(["127.0.0.1:1"]);
+        let record = registry.workers.get_mut("127.0.0.1:1").unwrap();
+        record.health = WorkerHealth::Healthy;
+        record.last_seen = Some(Instant::now());
+
+        assert_eq!(registry.healthy_workers().len(), 1);
+        registry.mark_unhealthy("127.0.0.1:1");
         assert!(registry.healthy_workers().is_empty());
     }
 }
