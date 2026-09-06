@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 forge-core = { path = "../forge-core" }
 forge-protocol = { path = "../forge-protocol" }
+forge-store = { path = "../forge-store" }
 
 [dev-dependencies]
 forge-worker = { path = "../forge-worker" }
