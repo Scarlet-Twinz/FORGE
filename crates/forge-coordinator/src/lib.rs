@@ -61,6 +61,10 @@ impl WorkerClient {
         self
     }
 
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
     fn connect(&self) -> Result<TcpStream, CoordinatorError> {
         let mut addresses = self.address.to_socket_addrs()?;
         let address = addresses.next().ok_or_else(|| {
@@ -211,12 +215,13 @@ impl DistributedExecutor {
             let handles = assignments
                 .into_iter()
                 .map(|(task_id, worker, command)| {
-                    thread::spawn(move || (task_id, worker.execute(task_id, command)))
+                    let address = worker.address().to_string();
+                    thread::spawn(move || (task_id, address, worker.execute(task_id, command)))
                 })
                 .collect::<Vec<_>>();
 
             for handle in handles {
-                let (task_id, result) = handle
+                let (task_id, address, result) = handle
                     .join()
                     .map_err(|_| CoordinatorError::SchedulerStalled)?;
                 match result {
@@ -224,7 +229,16 @@ impl DistributedExecutor {
                         graph.task_mut(task_id).expect("running task must exist").state = TaskState::Succeeded;
                         completed.push(task_id);
                     }
-                    Ok(_) | Err(_) => {
+                    Ok(_) => {
+                        let attempt = attempts.get(&task_id).copied().unwrap_or(1);
+                        if attempt < self.max_attempts {
+                            graph.task_mut(task_id).expect("running task must exist").state = TaskState::Pending;
+                        } else {
+                            graph.task_mut(task_id).expect("running task must exist").state = TaskState::Failed;
+                        }
+                    }
+                    Err(_) => {
+                        self.registry.mark_unhealthy(&address);
                         let attempt = attempts.get(&task_id).copied().unwrap_or(1);
                         if attempt < self.max_attempts {
                             graph.task_mut(task_id).expect("running task must exist").state = TaskState::Pending;
@@ -279,7 +293,6 @@ mod tests {
 
     #[test]
     fn distributed_executor_runs_dependency_order() {
-        // One heartbeat probe + two task executions = three accepted connections.
         let (address, worker_thread) = spawn_worker(Worker::new("graph-worker", 2), 3);
         let mut graph = TaskGraph::default();
         graph.add_task(1, "echo build", Vec::new()).unwrap();
@@ -304,5 +317,20 @@ mod tests {
         let error = executor.execute(&mut graph).unwrap_err();
         assert!(matches!(error, CoordinatorError::NoHealthyWorkers));
         assert_eq!(graph.task(1).unwrap().state, TaskState::Pending);
+    }
+
+    #[test]
+    fn command_failure_does_not_mark_worker_unhealthy() {
+        let (address, worker_thread) = spawn_worker(Worker::new("command-failure-worker", 1), 2);
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, "exit /B 1", Vec::new()).unwrap();
+
+        let mut executor = DistributedExecutor::new([address.clone()]);
+        let completed = executor.execute(&mut graph).unwrap();
+
+        assert!(completed.is_empty());
+        assert_eq!(graph.task(1).unwrap().state, TaskState::Failed);
+        assert_eq!(executor.healthy_worker_count(), 1);
+        worker_thread.join().unwrap();
     }
 }
