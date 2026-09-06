@@ -256,6 +256,7 @@ impl DistributedExecutor {
 mod tests {
     use super::*;
     use forge_worker::{handle_connection, Worker};
+    use std::io::Read;
     use std::net::TcpListener;
 
     fn spawn_worker(worker: Worker, connections: usize) -> (String, thread::JoinHandle<()>) {
@@ -268,6 +269,18 @@ mod tests {
             }
         });
         (address, thread)
+    }
+
+    fn spawn_dropping_worker(listener: TcpListener) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("dropping-worker", 1)).unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            drop(stream);
+        })
     }
 
     #[test]
@@ -332,5 +345,42 @@ mod tests {
         assert_eq!(graph.task(1).unwrap().state, TaskState::Failed);
         assert_eq!(executor.healthy_worker_count(), 1);
         worker_thread.join().unwrap();
+    }
+
+    #[test]
+    fn worker_failure_retries_task_on_another_healthy_worker() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address_a = listener_a.local_addr().unwrap().to_string();
+        let address_b = listener_b.local_addr().unwrap().to_string();
+
+        let (dead_listener, healthy_listener, dead_address, healthy_address) =
+            if address_a < address_b {
+                (listener_a, listener_b, address_a, address_b)
+            } else {
+                (listener_b, listener_a, address_b, address_a)
+            };
+
+        let dead_thread = spawn_dropping_worker(dead_listener);
+        let healthy_thread = thread::spawn(move || {
+            let (mut stream, _) = healthy_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("healthy-worker", 1)).unwrap();
+
+            let (mut stream, _) = healthy_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("healthy-worker", 1)).unwrap();
+        });
+
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, "echo recovered", Vec::new()).unwrap();
+
+        let mut executor = DistributedExecutor::new([dead_address, healthy_address]).with_max_attempts(2);
+        let completed = executor.execute(&mut graph).unwrap();
+
+        assert_eq!(completed, vec![1]);
+        assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
+        assert_eq!(executor.healthy_worker_count(), 1);
+
+        dead_thread.join().unwrap();
+        healthy_thread.join().unwrap();
     }
 }
