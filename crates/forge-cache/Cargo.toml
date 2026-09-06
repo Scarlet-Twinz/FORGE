@@ -1,0 +1,9 @@
+[package]
+name = "forge-cache"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-coordinator = { path = "../forge-coordinator" }
+forge-store = { path = "../forge-store" }
