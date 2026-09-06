@@ -390,32 +390,38 @@ mod tests {
 
     #[test]
     fn task_timeout_retries_on_another_healthy_worker() {
+        let marker = format!("forge-timeout-retry-{}.tmp", std::process::id());
+        let marker_for_command = marker.clone();
+        let command = if cfg!(target_os = "windows") {
+            format!("if exist {marker_for_command} (echo recovered) else (echo marker>{marker_for_command} & ping 127.0.0.1 -n 4 > nul)")
+        } else {
+            format!("if [ -f {marker_for_command} ]; then echo recovered; else touch {marker_for_command}; sleep 2; fi")
+        };
+
         let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
         let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
         let address_a = listener_a.local_addr().unwrap().to_string();
         let address_b = listener_b.local_addr().unwrap().to_string();
-        let (slow_listener, fast_listener, slow_address, fast_address) = if address_a < address_b {
+        let (first_listener, second_listener, first_address, second_address) = if address_a < address_b {
             (listener_a, listener_b, address_a, address_b)
         } else {
             (listener_b, listener_a, address_b, address_a)
         };
 
-        let slow_thread = thread::spawn(move || {
-            let (mut stream, _) = slow_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("slow-worker", 1)).unwrap();
-            let (mut stream, _) = slow_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("slow-worker", 1)).unwrap();
+        let first_thread = thread::spawn(move || {
+            let (mut stream, _) = first_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("timeout-first", 1)).unwrap();
+            let (mut stream, _) = first_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("timeout-first", 1)).unwrap();
         });
-        let fast_thread = thread::spawn(move || {
-            let (mut stream, _) = fast_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("fast-worker", 1)).unwrap();
-            let (mut stream, _) = fast_listener.accept().unwrap();
-            handle_connection(&mut stream, &Worker::new("fast-worker", 1)).unwrap();
+        let second_thread = thread::spawn(move || {
+            let (mut stream, _) = second_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("timeout-second", 1)).unwrap();
         });
 
         let mut graph = TaskGraph::default();
-        graph.add_task(1, long_running_command(), Vec::new()).unwrap();
-        let mut executor = DistributedExecutor::new([slow_address, fast_address])
+        graph.add_task(1, command, Vec::new()).unwrap();
+        let mut executor = DistributedExecutor::new([first_address, second_address])
             .with_max_attempts(2)
             .with_task_timeout(Duration::from_millis(100));
         let completed = executor.execute(&mut graph).unwrap();
@@ -423,7 +429,8 @@ mod tests {
         assert_eq!(completed, vec![1]);
         assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
         assert_eq!(executor.healthy_worker_count(), 2);
-        slow_thread.join().unwrap();
-        fast_thread.join().unwrap();
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+        let _ = std::fs::remove_file(marker);
     }
 }
