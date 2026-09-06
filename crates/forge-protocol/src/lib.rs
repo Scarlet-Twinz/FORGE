@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"FRGE";
 pub const VERSION: u8 = 1;
+pub const MAX_FRAME_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
@@ -19,11 +20,34 @@ pub struct Frame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRequest {
+    pub task_id: u64,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskResult {
+    pub task_id: u64,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub worker_id: String,
+    pub unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     InvalidMagic,
     UnsupportedVersion(u8),
     UnknownMessage(u8),
     FrameTooLarge(u32),
+    InvalidPayload(&'static str),
+    InvalidUtf8,
 }
 
 impl fmt::Display for ProtocolError {
@@ -33,6 +57,8 @@ impl fmt::Display for ProtocolError {
             Self::UnsupportedVersion(version) => write!(formatter, "unsupported protocol version {version}"),
             Self::UnknownMessage(kind) => write!(formatter, "unknown message kind {kind}"),
             Self::FrameTooLarge(length) => write!(formatter, "frame payload too large: {length} bytes"),
+            Self::InvalidPayload(message) => write!(formatter, "invalid payload: {message}"),
+            Self::InvalidUtf8 => write!(formatter, "payload contains invalid UTF-8"),
         }
     }
 }
@@ -53,6 +79,9 @@ impl MessageKind {
 
 impl Frame {
     pub fn encode<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        if self.payload.len() > MAX_FRAME_PAYLOAD as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame payload exceeds protocol limit"));
+        }
         writer.write_all(&MAGIC)?;
         writer.write_all(&[VERSION, self.kind as u8])?;
         writer.write_all(&(self.payload.len() as u32).to_be_bytes())?;
@@ -73,7 +102,7 @@ impl Frame {
         }
 
         let length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
-        if length > 16 * 1024 * 1024 {
+        if length > MAX_FRAME_PAYLOAD {
             return Err(Box::new(ProtocolError::FrameTooLarge(length)));
         }
 
@@ -81,6 +110,143 @@ impl Frame {
         let mut payload = vec![0u8; length as usize];
         reader.read_exact(&mut payload)?;
         Ok(Self { kind, payload })
+    }
+}
+
+fn put_u32(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_u64(buffer: &mut Vec<u8>, value: u64) {
+    buffer.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_i32(buffer: &mut Vec<u8>, value: i32) {
+    buffer.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ProtocolError> {
+    let length = u32::try_from(bytes.len()).map_err(|_| ProtocolError::InvalidPayload("field too large"))?;
+    put_u32(buffer, length);
+    buffer.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn put_string(buffer: &mut Vec<u8>, value: &str) -> Result<(), ProtocolError> {
+    put_bytes(buffer, value.as_bytes())
+}
+
+fn read_exact<'a>(payload: &'a [u8], offset: &mut usize, length: usize) -> Result<&'a [u8], ProtocolError> {
+    let end = offset.checked_add(length).ok_or(ProtocolError::InvalidPayload("offset overflow"))?;
+    if end > payload.len() {
+        return Err(ProtocolError::InvalidPayload("truncated payload"));
+    }
+    let bytes = &payload[*offset..end];
+    *offset = end;
+    Ok(bytes)
+}
+
+fn read_u32(payload: &[u8], offset: &mut usize) -> Result<u32, ProtocolError> {
+    let bytes = read_exact(payload, offset, 4)?;
+    Ok(u32::from_be_bytes(bytes.try_into().expect("length checked")))
+}
+
+fn read_u64(payload: &[u8], offset: &mut usize) -> Result<u64, ProtocolError> {
+    let bytes = read_exact(payload, offset, 8)?;
+    Ok(u64::from_be_bytes(bytes.try_into().expect("length checked")))
+}
+
+fn read_i32(payload: &[u8], offset: &mut usize) -> Result<i32, ProtocolError> {
+    let bytes = read_exact(payload, offset, 4)?;
+    Ok(i32::from_be_bytes(bytes.try_into().expect("length checked")))
+}
+
+fn read_bytes<'a>(payload: &'a [u8], offset: &mut usize) -> Result<&'a [u8], ProtocolError> {
+    let length = read_u32(payload, offset)? as usize;
+    read_exact(payload, offset, length)
+}
+
+fn read_string(payload: &[u8], offset: &mut usize) -> Result<String, ProtocolError> {
+    let bytes = read_bytes(payload, offset)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| ProtocolError::InvalidUtf8)
+}
+
+fn ensure_consumed(payload: &[u8], offset: usize) -> Result<(), ProtocolError> {
+    if offset == payload.len() {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidPayload("trailing bytes"))
+    }
+}
+
+impl TaskRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut payload = Vec::new();
+        put_u64(&mut payload, self.task_id);
+        put_string(&mut payload, &self.command)?;
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        let mut offset = 0;
+        let task_id = read_u64(payload, &mut offset)?;
+        let command = read_string(payload, &mut offset)?;
+        ensure_consumed(payload, offset)?;
+        Ok(Self { task_id, command })
+    }
+}
+
+impl TaskResult {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut payload = Vec::new();
+        put_u64(&mut payload, self.task_id);
+        payload.push(u8::from(self.success));
+        match self.exit_code {
+            Some(code) => {
+                payload.push(1);
+                put_i32(&mut payload, code);
+            }
+            None => payload.push(0),
+        }
+        put_string(&mut payload, &self.stdout)?;
+        put_string(&mut payload, &self.stderr)?;
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        let mut offset = 0;
+        let task_id = read_u64(payload, &mut offset)?;
+        let success = match read_exact(payload, &mut offset, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(ProtocolError::InvalidPayload("invalid success flag")),
+        };
+        let exit_code = match read_exact(payload, &mut offset, 1)?[0] {
+            0 => None,
+            1 => Some(read_i32(payload, &mut offset)?),
+            _ => return Err(ProtocolError::InvalidPayload("invalid exit-code flag")),
+        };
+        let stdout = read_string(payload, &mut offset)?;
+        let stderr = read_string(payload, &mut offset)?;
+        ensure_consumed(payload, offset)?;
+        Ok(Self { task_id, success, exit_code, stdout, stderr })
+    }
+}
+
+impl Heartbeat {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut payload = Vec::new();
+        put_string(&mut payload, &self.worker_id)?;
+        put_u64(&mut payload, self.unix_seconds);
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        let mut offset = 0;
+        let worker_id = read_string(payload, &mut offset)?;
+        let unix_seconds = read_u64(payload, &mut offset)?;
+        ensure_consumed(payload, offset)?;
+        Ok(Self { worker_id, unix_seconds })
     }
 }
 
@@ -98,5 +264,40 @@ mod tests {
         frame.encode(&mut bytes).unwrap();
         let decoded = Frame::decode(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn task_request_round_trip() {
+        let request = TaskRequest { task_id: 42, command: "echo forge".into() };
+        let encoded = request.encode().unwrap();
+        assert_eq!(TaskRequest::decode(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn task_result_round_trip() {
+        let result = TaskResult {
+            task_id: 42,
+            success: false,
+            exit_code: Some(7),
+            stdout: "out".into(),
+            stderr: "err".into(),
+        };
+        let encoded = result.encode().unwrap();
+        assert_eq!(TaskResult::decode(&encoded).unwrap(), result);
+    }
+
+    #[test]
+    fn heartbeat_round_trip() {
+        let heartbeat = Heartbeat { worker_id: "worker-1".into(), unix_seconds: 1234 };
+        let encoded = heartbeat.encode().unwrap();
+        assert_eq!(Heartbeat::decode(&encoded).unwrap(), heartbeat);
+    }
+
+    #[test]
+    fn malformed_payload_is_rejected() {
+        assert_eq!(
+            TaskRequest::decode(&[0, 0, 0]).unwrap_err(),
+            ProtocolError::InvalidPayload("truncated payload")
+        );
     }
 }
