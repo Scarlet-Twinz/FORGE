@@ -218,6 +218,14 @@ The core execution path is implemented and tested, including:
 
 The remaining larger engineering layers are separate from the current implementation: richer CLI commands, benchmark suites, fault-injection scenarios, full crash recovery, and caching/restoration of actual task output.
 
+## Author
+
+**Anthony Emmanuella Mmasinachi**
+
+Software developer focused on systems engineering, backend infrastructure, APIs, distributed systems, databases, automation, and practical software architecture.
+
+**GitHub:** https://github.com/Scarlet-Twinz
+
 ## License
 
 MIT
