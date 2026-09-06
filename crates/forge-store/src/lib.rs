@@ -1,3 +1,5 @@
+pub mod journal;
+
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
