@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge-core",
+    "crates/forge-worker",
+    "crates/forge-protocol",
+    "crates/forge-store",
+    "crates/forge-cli",
+]
