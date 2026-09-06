@@ -1,0 +1,11 @@
+[package]
+name = "forge-metrics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+forge-coordinator = { path = "../forge-coordinator" }
+forge-core = { path = "../forge-core" }
+
+[dev-dependencies]
+forge-worker = { path = "../forge-worker" }
