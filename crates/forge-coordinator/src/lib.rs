@@ -50,10 +50,7 @@ pub struct WorkerClient {
 
 impl WorkerClient {
     pub fn new(address: impl Into<String>) -> Self {
-        Self {
-            address: address.into(),
-            connect_timeout: Duration::from_secs(5),
-        }
+        Self { address: address.into(), connect_timeout: Duration::from_secs(5) }
     }
 
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
@@ -68,34 +65,33 @@ impl WorkerClient {
     fn connect(&self) -> Result<TcpStream, CoordinatorError> {
         let mut addresses = self.address.to_socket_addrs()?;
         let address = addresses.next().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "worker address resolved to no endpoints",
-            )
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "worker address resolved to no endpoints")
         })?;
         let stream = TcpStream::connect_timeout(&address, self.connect_timeout)?;
         stream.set_nodelay(true)?;
         Ok(stream)
     }
 
-    pub fn execute(
+    pub fn execute(&self, task_id: u64, command: impl Into<String>) -> Result<TaskResult, CoordinatorError> {
+        self.execute_with_timeout(task_id, command, None)
+    }
+
+    pub fn execute_with_timeout(
         &self,
         task_id: u64,
         command: impl Into<String>,
+        timeout: Option<Duration>,
     ) -> Result<TaskResult, CoordinatorError> {
         let mut stream = self.connect()?;
         let request = TaskRequest {
             task_id,
             command: command.into(),
+            timeout_ms: timeout.map(|value| value.as_millis().min(u64::MAX as u128) as u64),
         };
         let payload = request
             .encode()
             .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
-        Frame {
-            kind: MessageKind::TaskRequest,
-            payload,
-        }
-        .encode(&mut stream)?;
+        Frame { kind: MessageKind::TaskRequest, payload }.encode(&mut stream)?;
         stream.flush()?;
 
         let response = Frame::decode(&mut stream)
@@ -109,17 +105,10 @@ impl WorkerClient {
 
     pub fn heartbeat(&self) -> Result<Heartbeat, CoordinatorError> {
         let mut stream = self.connect()?;
-        let payload = Heartbeat {
-            worker_id: String::new(),
-            unix_seconds: 0,
-        }
-        .encode()
-        .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
-        Frame {
-            kind: MessageKind::Heartbeat,
-            payload,
-        }
-        .encode(&mut stream)?;
+        let payload = Heartbeat { worker_id: String::new(), unix_seconds: 0 }
+            .encode()
+            .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
+        Frame { kind: MessageKind::Heartbeat, payload }.encode(&mut stream)?;
         stream.flush()?;
 
         let response = Frame::decode(&mut stream)
@@ -137,6 +126,7 @@ pub struct DistributedExecutor {
     workers: Vec<WorkerClient>,
     registry: WorkerRegistry,
     max_attempts: usize,
+    task_timeout: Option<Duration>,
 }
 
 impl DistributedExecutor {
@@ -147,15 +137,21 @@ impl DistributedExecutor {
     {
         let workers = addresses.into_iter().map(WorkerClient::new).collect::<Vec<_>>();
         let registry = WorkerRegistry::new(workers.iter().map(|worker| worker.address.clone()));
-        Self {
-            workers,
-            registry,
-            max_attempts: 1,
-        }
+        Self { workers, registry, max_attempts: 1, task_timeout: None }
     }
 
     pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
         self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    pub fn with_task_timeout(mut self, timeout: Duration) -> Self {
+        self.task_timeout = Some(timeout);
+        self
+    }
+
+    pub fn without_task_timeout(mut self) -> Self {
+        self.task_timeout = None;
         self
     }
 
@@ -200,11 +196,7 @@ impl DistributedExecutor {
                 .map(|task_id| {
                     let worker = healthy_workers[worker_index % healthy_workers.len()].clone();
                     worker_index += 1;
-                    let command = graph
-                        .task(task_id)
-                        .expect("runnable task must exist")
-                        .command
-                        .clone();
+                    let command = graph.task(task_id).expect("runnable task must exist").command.clone();
                     graph.task_mut(task_id).expect("runnable task must exist").state = TaskState::Running;
                     let attempt = attempts.entry(task_id).or_insert(0);
                     *attempt += 1;
@@ -212,11 +204,14 @@ impl DistributedExecutor {
                 })
                 .collect::<Vec<_>>();
 
+            let timeout = self.task_timeout;
             let handles = assignments
                 .into_iter()
                 .map(|(task_id, worker, command)| {
                     let address = worker.address().to_string();
-                    thread::spawn(move || (task_id, address, worker.execute(task_id, command)))
+                    thread::spawn(move || {
+                        (task_id, address, worker.execute_with_timeout(task_id, command, timeout))
+                    })
                 })
                 .collect::<Vec<_>>();
 
@@ -228,6 +223,14 @@ impl DistributedExecutor {
                     Ok(result) if result.success => {
                         graph.task_mut(task_id).expect("running task must exist").state = TaskState::Succeeded;
                         completed.push(task_id);
+                    }
+                    Ok(result) if result.timed_out => {
+                        let attempt = attempts.get(&task_id).copied().unwrap_or(1);
+                        if attempt < self.max_attempts {
+                            graph.task_mut(task_id).expect("running task must exist").state = TaskState::Pending;
+                        } else {
+                            graph.task_mut(task_id).expect("running task must exist").state = TaskState::Failed;
+                        }
                     }
                     Ok(_) => {
                         let attempt = attempts.get(&task_id).copied().unwrap_or(1);
@@ -275,7 +278,6 @@ mod tests {
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             handle_connection(&mut stream, &Worker::new("dropping-worker", 1)).unwrap();
-
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0u8; 1024];
             let _ = stream.read(&mut buffer);
@@ -283,12 +285,14 @@ mod tests {
         })
     }
 
+    fn long_running_command() -> &'static str {
+        if cfg!(target_os = "windows") { "ping 127.0.0.1 -n 4 > nul" } else { "sleep 2" }
+    }
+
     #[test]
     fn client_executes_task_on_remote_worker() {
         let (address, worker_thread) = spawn_worker(Worker::new("test-worker", 1), 1);
-        let result = WorkerClient::new(address)
-            .execute(42, "echo distributed-forge")
-            .unwrap();
+        let result = WorkerClient::new(address).execute(42, "echo distributed-forge").unwrap();
         assert_eq!(result.task_id, 42);
         assert!(result.success);
         assert!(result.stdout.to_ascii_lowercase().contains("distributed-forge"));
@@ -310,10 +314,8 @@ mod tests {
         let mut graph = TaskGraph::default();
         graph.add_task(1, "echo build", Vec::new()).unwrap();
         graph.add_task(2, "echo test", vec![1]).unwrap();
-
         let mut executor = DistributedExecutor::new([address]);
         let completed = executor.execute(&mut graph).unwrap();
-
         assert_eq!(completed, vec![1, 2]);
         assert_eq!(executor.healthy_worker_count(), 1);
         assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
@@ -325,7 +327,6 @@ mod tests {
     fn distributed_executor_rejects_only_unhealthy_workers() {
         let mut graph = TaskGraph::default();
         graph.add_task(1, "echo never-runs", Vec::new()).unwrap();
-
         let mut executor = DistributedExecutor::new(["127.0.0.1:1"]);
         let error = executor.execute(&mut graph).unwrap_err();
         assert!(matches!(error, CoordinatorError::NoHealthyWorkers));
@@ -337,10 +338,8 @@ mod tests {
         let (address, worker_thread) = spawn_worker(Worker::new("command-failure-worker", 1), 2);
         let mut graph = TaskGraph::default();
         graph.add_task(1, "exit /B 1", Vec::new()).unwrap();
-
         let mut executor = DistributedExecutor::new([address.clone()]);
         let completed = executor.execute(&mut graph).unwrap();
-
         assert!(completed.is_empty());
         assert_eq!(graph.task(1).unwrap().state, TaskState::Failed);
         assert_eq!(executor.healthy_worker_count(), 1);
@@ -353,34 +352,78 @@ mod tests {
         let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
         let address_a = listener_a.local_addr().unwrap().to_string();
         let address_b = listener_b.local_addr().unwrap().to_string();
-
-        let (dead_listener, healthy_listener, dead_address, healthy_address) =
-            if address_a < address_b {
-                (listener_a, listener_b, address_a, address_b)
-            } else {
-                (listener_b, listener_a, address_b, address_a)
-            };
-
+        let (dead_listener, healthy_listener, dead_address, healthy_address) = if address_a < address_b {
+            (listener_a, listener_b, address_a, address_b)
+        } else {
+            (listener_b, listener_a, address_b, address_a)
+        };
         let dead_thread = spawn_dropping_worker(dead_listener);
         let healthy_thread = thread::spawn(move || {
             let (mut stream, _) = healthy_listener.accept().unwrap();
             handle_connection(&mut stream, &Worker::new("healthy-worker", 1)).unwrap();
-
             let (mut stream, _) = healthy_listener.accept().unwrap();
             handle_connection(&mut stream, &Worker::new("healthy-worker", 1)).unwrap();
         });
-
         let mut graph = TaskGraph::default();
         graph.add_task(1, "echo recovered", Vec::new()).unwrap();
-
         let mut executor = DistributedExecutor::new([dead_address, healthy_address]).with_max_attempts(2);
+        let completed = executor.execute(&mut graph).unwrap();
+        assert_eq!(completed, vec![1]);
+        assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
+        assert_eq!(executor.healthy_worker_count(), 1);
+        dead_thread.join().unwrap();
+        healthy_thread.join().unwrap();
+    }
+
+    #[test]
+    fn task_timeout_marks_task_failed_but_keeps_worker_healthy() {
+        let (address, worker_thread) = spawn_worker(Worker::new("timeout-worker", 1), 2);
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, long_running_command(), Vec::new()).unwrap();
+        let mut executor = DistributedExecutor::new([address]).with_task_timeout(Duration::from_millis(100));
+        let completed = executor.execute(&mut graph).unwrap();
+        assert!(completed.is_empty());
+        assert_eq!(graph.task(1).unwrap().state, TaskState::Failed);
+        assert_eq!(executor.healthy_worker_count(), 1);
+        worker_thread.join().unwrap();
+    }
+
+    #[test]
+    fn task_timeout_retries_on_another_healthy_worker() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address_a = listener_a.local_addr().unwrap().to_string();
+        let address_b = listener_b.local_addr().unwrap().to_string();
+        let (slow_listener, fast_listener, slow_address, fast_address) = if address_a < address_b {
+            (listener_a, listener_b, address_a, address_b)
+        } else {
+            (listener_b, listener_a, address_b, address_a)
+        };
+
+        let slow_thread = thread::spawn(move || {
+            let (mut stream, _) = slow_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("slow-worker", 1)).unwrap();
+            let (mut stream, _) = slow_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("slow-worker", 1)).unwrap();
+        });
+        let fast_thread = thread::spawn(move || {
+            let (mut stream, _) = fast_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("fast-worker", 1)).unwrap();
+            let (mut stream, _) = fast_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("fast-worker", 1)).unwrap();
+        });
+
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, long_running_command(), Vec::new()).unwrap();
+        let mut executor = DistributedExecutor::new([slow_address, fast_address])
+            .with_max_attempts(2)
+            .with_task_timeout(Duration::from_millis(100));
         let completed = executor.execute(&mut graph).unwrap();
 
         assert_eq!(completed, vec![1]);
         assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
-        assert_eq!(executor.healthy_worker_count(), 1);
-
-        dead_thread.join().unwrap();
-        healthy_thread.join().unwrap();
+        assert_eq!(executor.healthy_worker_count(), 2);
+        slow_thread.join().unwrap();
+        fast_thread.join().unwrap();
     }
 }
