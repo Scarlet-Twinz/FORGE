@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use forge_protocol::{Frame, Heartbeat, MessageKind, TaskRequest as WireTaskRequest, TaskResult as WireTaskResult};
@@ -14,21 +15,69 @@ pub struct TaskResult {
     pub duration: Duration,
 }
 
+#[derive(Debug)]
+struct ConcurrencyGate {
+    state: Mutex<usize>,
+    changed: Condvar,
+    limit: usize,
+}
+
+impl ConcurrencyGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(0),
+            changed: Condvar::new(),
+            limit,
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> ConcurrencyPermit {
+        let mut active = self.state.lock().expect("worker concurrency mutex poisoned");
+        while *active >= self.limit {
+            active = self
+                .changed
+                .wait(active)
+                .expect("worker concurrency mutex poisoned");
+        }
+        *active += 1;
+        ConcurrencyPermit {
+            gate: Arc::clone(self),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConcurrencyPermit {
+    gate: Arc<ConcurrencyGate>,
+}
+
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut active = self.gate.state.lock().expect("worker concurrency mutex poisoned");
+        *active -= 1;
+        self.gate.changed.notify_one();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Worker {
     pub id: String,
     pub max_concurrency: usize,
+    gate: Arc<ConcurrencyGate>,
 }
 
 impl Worker {
     pub fn new(id: impl Into<String>, max_concurrency: usize) -> Self {
+        let max_concurrency = max_concurrency.max(1);
         Self {
             id: id.into(),
-            max_concurrency: max_concurrency.max(1),
+            max_concurrency,
+            gate: Arc::new(ConcurrencyGate::new(max_concurrency)),
         }
     }
 
     pub fn execute(&self, command: &str) -> std::io::Result<TaskResult> {
+        let _permit = self.gate.acquire();
         let started = Instant::now();
         let output = Command::new(default_shell())
             .args(default_shell_args(command))
@@ -123,5 +172,13 @@ mod tests {
     #[test]
     fn worker_concurrency_is_never_zero() {
         assert_eq!(Worker::new("local", 0).max_concurrency, 1);
+    }
+
+    #[test]
+    fn cloned_workers_share_the_same_concurrency_gate() {
+        let worker = Worker::new("local", 3);
+        let clone = worker.clone();
+        assert!(Arc::ptr_eq(&worker.gate, &clone.gate));
+        assert_eq!(worker.gate.limit, 3);
     }
 }
