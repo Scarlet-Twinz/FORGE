@@ -417,6 +417,8 @@ mod tests {
         let second_thread = thread::spawn(move || {
             let (mut stream, _) = second_listener.accept().unwrap();
             handle_connection(&mut stream, &Worker::new("timeout-second", 1)).unwrap();
+            let (mut stream, _) = second_listener.accept().unwrap();
+            handle_connection(&mut stream, &Worker::new("timeout-second", 1)).unwrap();
         });
 
         let mut graph = TaskGraph::default();
