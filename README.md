@@ -45,32 +45,36 @@ Worker A              Worker B
 - **Persistence** — atomic file-backed job records that survive process reopen.
 - **Artifact store** — content-addressed binary artifacts keyed by SHA-256, stored atomically and deduplicated by content.
 - **Cache index** — persistent task/cache-key to artifact-hash mappings with deterministic on-disk ordering and validation of stored hashes.
+- **Execution cache** — cache-aware distributed execution can satisfy previously successful tasks without contacting a worker when the command and timeout identity match and the backing artifact still exists.
 - **CLI** — local execution path plus a coordinator executable for remote worker execution.
 
 ## Artifact and Cache Model
 
-FORGE separates immutable artifact data from the cache index:
+FORGE separates immutable artifact data from cache metadata:
 
 ```text
-Task output bytes
-      |
-      v
+Task identity
+     |
+     v
    SHA-256
-      |
-      v
-ArtifactStore ───> objects/<hash>
-      ^
-      |
-CacheStore ──────> cache-key -> artifact-hash
+     |
+     v
+ CacheStore ──────> task-key -> artifact-hash
+                           |
+                           v
+                    ArtifactStore
+                           |
+                           v
+                    objects/<hash>
 ```
 
-This allows identical outputs to share one stored object while cache metadata remains independently replaceable and persistent across process restarts. The current layer provides the storage primitives; automatic scheduler-level cache reuse will be integrated as a later execution-layer change.
+A cache entry is valid only while its referenced content-addressed object exists. Cache identity currently includes the command and configured task timeout, giving the execution cache a deterministic versioned key. The cache layer is deliberately separate from the core scheduler so storage policy can evolve without coupling the task graph to filesystem details.
 
 ## Engineering Direction
 
 The system is built from the execution layer upward. Correctness, deterministic scheduling, explicit state transitions, protocol validation, process isolation, concurrency control, and failure handling take priority over presentation.
 
-The distributed layer is intentionally built in validated increments. The current implementation has a real coordinator-to-worker TCP path, heartbeat-based worker health, concurrent worker connections, dependency-aware distributed execution, configurable retries, timeout-triggered process termination, content-addressed artifact storage, and a persistent cache index. Durable event/WAL semantics, automatic scheduler-level cache reuse, richer CLI commands, explicit user cancellation messages, metrics, benchmarks, and fault-injection scenarios remain separate engineering layers and will be added only when implemented and tested.
+The distributed layer is intentionally built in validated increments. The current implementation has a real coordinator-to-worker TCP path, heartbeat-based worker health, concurrent worker connections, dependency-aware distributed execution, configurable retries, timeout-triggered process termination, content-addressed artifact storage, a persistent cache index, and cache-aware distributed execution. Durable event/WAL semantics, richer CLI commands, explicit user cancellation messages, metrics, benchmarks, and fault-injection scenarios remain separate engineering layers and will be added only when implemented and tested.
 
 ## Repository Structure
 
@@ -82,6 +86,7 @@ forge/
 │   ├── forge-protocol/    # Versioned client/worker wire protocol
 │   ├── forge-store/       # Persistent state, artifacts, and cache index
 │   ├── forge-coordinator/ # Distributed worker client + DAG executor
+│   ├── forge-cache/       # Cache-aware distributed execution
 │   └── forge-cli/         # Local execution CLI
 ├── tests/                 # Integration and fault tests
 ├── benches/               # Performance benchmarks
@@ -91,7 +96,7 @@ forge/
 
 ## Status
 
-The execution core, local scheduling, persistence foundation, binary protocol, concurrent TCP workers, heartbeat-based worker health, distributed DAG execution, retry foundation, timeout-triggered process cancellation, content-addressed artifact storage, and persistent cache index are implemented. The project is still under active systems-engineering development and is intentionally focused on infrastructure depth rather than a web frontend.
+The execution core, local scheduling, persistence foundation, binary protocol, concurrent TCP workers, heartbeat-based worker health, distributed DAG execution, retry foundation, timeout-triggered process cancellation, content-addressed artifact storage, persistent cache index, and cache-aware distributed execution are implemented. The project is still under active systems-engineering development and is intentionally focused on infrastructure depth rather than a web frontend.
 
 ## License
 
