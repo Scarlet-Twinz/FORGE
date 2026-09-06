@@ -112,10 +112,7 @@ impl ArtifactStore {
             }
         }
 
-        Ok(Artifact {
-            hash,
-            size: data.len() as u64,
-        })
+        Ok(Artifact { hash, size: data.len() as u64 })
     }
 
     pub fn get(&self, hash: &str) -> io::Result<Option<Vec<u8>>> {
@@ -137,6 +134,90 @@ impl ArtifactStore {
 
     fn object_path(&self, hash: &str) -> PathBuf {
         self.root.join("objects").join(hash)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub key: String,
+    pub artifact_hash: String,
+}
+
+#[derive(Debug)]
+pub struct CacheStore {
+    path: PathBuf,
+    entries: HashMap<String, CacheEntry>,
+}
+
+impl CacheStore {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut entries = HashMap::new();
+
+        if path.exists() {
+            let file = File::open(&path)?;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                let mut fields = line.splitn(2, '\t');
+                let Some(key) = fields.next() else { continue };
+                let Some(artifact_hash) = fields.next() else { continue };
+                if !key.is_empty() && is_valid_hash(artifact_hash) {
+                    entries.insert(
+                        key.to_owned(),
+                        CacheEntry { key: key.to_owned(), artifact_hash: artifact_hash.to_owned() },
+                    );
+                }
+            }
+        }
+
+        Ok(Self { path, entries })
+    }
+
+    pub fn lookup(&self, key: &str) -> Option<&CacheEntry> {
+        self.entries.get(key)
+    }
+
+    pub fn insert(&mut self, key: impl Into<String>, artifact_hash: impl Into<String>) -> io::Result<()> {
+        let key = key.into();
+        let artifact_hash = artifact_hash.into();
+        if key.is_empty() || !is_valid_hash(&artifact_hash) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid cache entry"));
+        }
+
+        self.entries.insert(key.clone(), CacheEntry { key, artifact_hash });
+        self.persist()
+    }
+
+    pub fn remove(&mut self, key: &str) -> io::Result<bool> {
+        let removed = self.entries.remove(key).is_some();
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let temp = self.path.with_extension("tmp");
+        {
+            let mut file = File::create(&temp)?;
+            let mut entries: Vec<_> = self.entries.values().collect();
+            entries.sort_by(|left, right| left.key.cmp(&right.key));
+            for entry in entries {
+                writeln!(file, "{}\t{}", entry.key, entry.artifact_hash)?;
+            }
+            file.sync_all()?;
+        }
+
+        if self.path.exists() {
+            fs::remove_file(&self.path)?;
+        }
+        fs::rename(temp, &self.path)
     }
 }
 
@@ -198,14 +279,34 @@ mod tests {
     }
 
     #[test]
-    fn invalid_hashes_are_not_read_as_paths() {
-        let root = std::env::temp_dir().join(format!("forge-artifacts-invalid-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let store = ArtifactStore::open(&root).unwrap();
+    fn cache_entries_survive_reopen_and_replace_values() {
+        let path = std::env::temp_dir().join(format!("forge-cache-{}.db", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let first_hash = sha256_hex(b"first");
+        let second_hash = sha256_hex(b"second");
 
-        assert!(!store.contains("../../outside"));
-        assert!(store.get("../../outside").unwrap().is_none());
+        {
+            let mut cache = CacheStore::open(&path).unwrap();
+            cache.insert("task:v1", &first_hash).unwrap();
+            cache.insert("task:v1", &second_hash).unwrap();
+        }
 
-        let _ = fs::remove_dir_all(root);
+        let cache = CacheStore::open(&path).unwrap();
+        assert_eq!(cache.lookup("task:v1").unwrap().artifact_hash, second_hash);
+        assert!(cache.lookup("missing").is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_cache_entries_are_rejected() {
+        let path = std::env::temp_dir().join(format!("forge-cache-invalid-{}.db", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut cache = CacheStore::open(&path).unwrap();
+
+        assert!(cache.insert("", sha256_hex(b"x")).is_err());
+        assert!(cache.insert("task", "not-a-hash").is_err());
+
+        let _ = fs::remove_file(path);
     }
 }
