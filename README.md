@@ -27,6 +27,9 @@ Worker A              Worker B
                |
                v
         Artifact / Cache
+               |
+               v
+        Execution Journal
 ```
 
 ## Current Implementation
@@ -46,6 +49,7 @@ Worker A              Worker B
 - **Artifact store** — content-addressed binary artifacts keyed by SHA-256, stored atomically and deduplicated by content.
 - **Cache index** — persistent task/cache-key to artifact-hash mappings with deterministic on-disk ordering and validation of stored hashes.
 - **Execution cache** — cache-aware distributed execution can satisfy previously successful tasks without contacting a worker when the command and timeout identity match and the backing artifact still exists.
+- **Execution journal** — append-only, fsynced task lifecycle records can be replayed after process reopen; the journaled coordinator writes task-start records before distributed execution and terminal records after execution completes.
 - **CLI** — local execution path plus a coordinator executable for remote worker execution.
 
 ## Artifact and Cache Model
@@ -70,11 +74,30 @@ Task identity
 
 A cache entry is valid only while its referenced content-addressed object exists. Cache identity currently includes the command and configured task timeout, giving the execution cache a deterministic versioned key. The cache layer is deliberately separate from the core scheduler so storage policy can evolve without coupling the task graph to filesystem details.
 
+## Execution Journal
+
+The journal is an append-only durability primitive separate from the snapshot-style job store:
+
+```text
+Coordinator
+    |
+    +--> TaskStarted --------> journal.log (fsync)
+    |
+    +--> distributed execution
+    |
+    +--> TaskSucceeded/Failed -> journal.log (fsync)
+                                  |
+                                  v
+                               replay()
+```
+
+Journal records are encoded as validated, tab-separated events. Worker addresses are escaped, malformed event records are rejected during replay, and every append is flushed through `sync_data()` before it is considered durable. The current journaled executor records lifecycle boundaries; it is not yet a full crash-recovery state machine or replacement for the existing job snapshot store.
+
 ## Engineering Direction
 
 The system is built from the execution layer upward. Correctness, deterministic scheduling, explicit state transitions, protocol validation, process isolation, concurrency control, and failure handling take priority over presentation.
 
-The distributed layer is intentionally built in validated increments. The current implementation has a real coordinator-to-worker TCP path, heartbeat-based worker health, concurrent worker connections, dependency-aware distributed execution, configurable retries, timeout-triggered process termination, content-addressed artifact storage, a persistent cache index, and cache-aware distributed execution. Durable event/WAL semantics, richer CLI commands, explicit user cancellation messages, metrics, benchmarks, and fault-injection scenarios remain separate engineering layers and will be added only when implemented and tested.
+The distributed layer is intentionally built in validated increments. The current implementation has a real coordinator-to-worker TCP path, heartbeat-based worker health, concurrent worker connections, dependency-aware distributed execution, configurable retries, timeout-triggered process termination, content-addressed artifact storage, a persistent cache index, cache-aware distributed execution, and a durable execution-journal foundation. Metrics, benchmarks, fault-injection scenarios, richer CLI commands, explicit user cancellation messages, and a full crash-recovery state machine remain separate engineering layers and will be added only when implemented and tested.
 
 ## Repository Structure
 
@@ -84,7 +107,7 @@ forge/
 │   ├── forge-core/        # Task graph, scheduler, state machine
 │   ├── forge-worker/      # Worker execution runtime + TCP service
 │   ├── forge-protocol/    # Versioned client/worker wire protocol
-│   ├── forge-store/       # Persistent state, artifacts, and cache index
+│   ├── forge-store/       # Persistent state, artifacts, cache index, journal
 │   ├── forge-coordinator/ # Distributed worker client + DAG executor
 │   ├── forge-cache/       # Cache-aware distributed execution
 │   └── forge-cli/         # Local execution CLI
@@ -96,7 +119,7 @@ forge/
 
 ## Status
 
-The execution core, local scheduling, persistence foundation, binary protocol, concurrent TCP workers, heartbeat-based worker health, distributed DAG execution, retry foundation, timeout-triggered process cancellation, content-addressed artifact storage, persistent cache index, and cache-aware distributed execution are implemented. The project is still under active systems-engineering development and is intentionally focused on infrastructure depth rather than a web frontend.
+The execution core, local scheduling, persistence foundation, binary protocol, concurrent TCP workers, heartbeat-based worker health, distributed DAG execution, retry foundation, timeout-triggered process cancellation, content-addressed artifact storage, persistent cache index, cache-aware distributed execution, and execution-journal foundation are implemented and tested. The project is still under active systems-engineering development and is intentionally focused on infrastructure depth rather than a web frontend.
 
 ## License
 
