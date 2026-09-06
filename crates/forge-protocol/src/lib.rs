@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"FRGE";
@@ -24,6 +25,19 @@ pub enum ProtocolError {
     UnknownMessage(u8),
     FrameTooLarge(u32),
 }
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMagic => write!(formatter, "invalid frame magic"),
+            Self::UnsupportedVersion(version) => write!(formatter, "unsupported protocol version {version}"),
+            Self::UnknownMessage(kind) => write!(formatter, "unknown message kind {kind}"),
+            Self::FrameTooLarge(length) => write!(formatter, "frame payload too large: {length} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
 
 impl MessageKind {
     fn from_byte(value: u8) -> Result<Self, ProtocolError> {
@@ -63,7 +77,7 @@ impl Frame {
             return Err(Box::new(ProtocolError::FrameTooLarge(length)));
         }
 
-        let kind = MessageKind::from_byte(header[1]).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+        let kind = MessageKind::from_byte(header[1])?;
         let mut payload = vec![0u8; length as usize];
         reader.read_exact(&mut payload)?;
         Ok(Self { kind, payload })
