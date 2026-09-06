@@ -8,4 +8,5 @@ members = [
     "crates/forge-cli",
     "crates/forge-coordinator",
     "crates/forge-cache",
+    "crates/forge-metrics",
 ]
