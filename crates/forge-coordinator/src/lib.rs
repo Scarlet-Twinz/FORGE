@@ -216,19 +216,21 @@ mod tests {
     use forge_worker::{handle_connection, Worker};
     use std::net::TcpListener;
 
-    fn spawn_worker_once(worker: Worker) -> (String, thread::JoinHandle<()>) {
+    fn spawn_worker(worker: Worker, connections: usize) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let thread = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            handle_connection(&mut stream, &worker).unwrap();
+            for _ in 0..connections {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_connection(&mut stream, &worker).unwrap();
+            }
         });
         (address, thread)
     }
 
     #[test]
     fn client_executes_task_on_remote_worker() {
-        let (address, worker_thread) = spawn_worker_once(Worker::new("test-worker", 1));
+        let (address, worker_thread) = spawn_worker(Worker::new("test-worker", 1), 1);
         let result = WorkerClient::new(address)
             .execute(42, "echo distributed-forge")
             .unwrap();
@@ -240,7 +242,7 @@ mod tests {
 
     #[test]
     fn client_reads_worker_heartbeat() {
-        let (address, worker_thread) = spawn_worker_once(Worker::new("heartbeat-worker", 1));
+        let (address, worker_thread) = spawn_worker(Worker::new("heartbeat-worker", 1), 1);
         let heartbeat = WorkerClient::new(address).heartbeat().unwrap();
         assert_eq!(heartbeat.worker_id, "heartbeat-worker");
         assert!(heartbeat.unix_seconds > 0);
@@ -249,7 +251,7 @@ mod tests {
 
     #[test]
     fn distributed_executor_runs_dependency_order() {
-        let (address, worker_thread) = spawn_worker_once(Worker::new("graph-worker", 2));
+        let (address, worker_thread) = spawn_worker(Worker::new("graph-worker", 2), 2);
         let mut graph = TaskGraph::default();
         graph.add_task(1, "echo build", Vec::new()).unwrap();
         graph.add_task(2, "echo test", vec![1]).unwrap();
