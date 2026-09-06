@@ -37,6 +37,7 @@ Worker A              Worker B
 - **Task graph** — dependency-aware tasks with deterministic ordering and blocked-dependency propagation.
 - **Local scheduler** — deterministic runnable-task dispatch.
 - **Distributed executor** — executes runnable DAG tasks through remote workers and advances the graph only after task results are received.
+- **Worker health registry** — probes configured workers with heartbeats, records worker identity and last-seen time, expires stale workers, and prevents unhealthy workers from receiving scheduled work.
 - **Retry policy** — configurable maximum task attempts for failed commands or worker communication failures.
 - **Worker runtime** — executes tasks as isolated child processes with a shared concurrency limit across worker connection threads.
 - **Wire protocol** — versioned binary frames with structured task requests, task results, and heartbeats.
@@ -49,7 +50,7 @@ Worker A              Worker B
 
 The system is built from the execution layer upward. Correctness, deterministic scheduling, explicit state transitions, protocol validation, process isolation, concurrency control, and failure handling take priority over presentation.
 
-The distributed layer is intentionally built in validated increments. The current implementation has a real coordinator-to-worker TCP path, heartbeat probing, concurrent worker connections, dependency-aware distributed execution, and configurable retries. Artifact caching, durable event/WAL semantics, worker registration and health tracking, richer CLI commands, fault injection, metrics, and benchmarks remain separate engineering layers and will be added only when implemented and tested.
+The distributed layer is intentionally built in validated increments. The current implementation has a real coordinator-to-worker TCP path, heartbeat-based worker health, concurrent worker connections, dependency-aware distributed execution, and configurable retries. Artifact caching, durable event/WAL semantics, richer CLI commands, fault injection, metrics, and benchmarks remain separate engineering layers and will be added only when implemented and tested.
 
 ## Repository Structure
 
@@ -70,7 +71,7 @@ forge/
 
 ## Status
 
-The execution core, local scheduling, persistence foundation, binary protocol, concurrent TCP workers, heartbeat probing, distributed DAG execution, and retry foundation are implemented. The project is still under active systems-engineering development and is intentionally focused on infrastructure depth rather than a web frontend.
+The execution core, local scheduling, persistence foundation, binary protocol, concurrent TCP workers, heartbeat-based worker health, distributed DAG execution, and retry foundation are implemented. The project is still under active systems-engineering development and is intentionally focused on infrastructure depth rather than a web frontend.
 
 ## License
 
