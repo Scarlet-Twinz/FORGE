@@ -6,4 +6,5 @@ members = [
     "crates/forge-protocol",
     "crates/forge-store",
     "crates/forge-cli",
+    "crates/forge-coordinator",
 ]
