@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use forge_core::{TaskGraph, TaskId, TaskState};
 use forge_protocol::{Frame, Heartbeat, MessageKind, TaskRequest, TaskResult};
+use worker_registry::WorkerRegistry;
 
 #[derive(Debug)]
 pub enum CoordinatorError {
@@ -16,6 +17,7 @@ pub enum CoordinatorError {
     Protocol(String),
     UnexpectedMessage(MessageKind),
     NoWorkers,
+    NoHealthyWorkers,
     SchedulerStalled,
 }
 
@@ -26,6 +28,7 @@ impl fmt::Display for CoordinatorError {
             Self::Protocol(error) => write!(formatter, "protocol error: {error}"),
             Self::UnexpectedMessage(kind) => write!(formatter, "unexpected worker message: {kind:?}"),
             Self::NoWorkers => write!(formatter, "distributed executor has no workers"),
+            Self::NoHealthyWorkers => write!(formatter, "distributed executor has no healthy workers"),
             Self::SchedulerStalled => write!(formatter, "distributed scheduler stalled with pending tasks"),
         }
     }
@@ -121,6 +124,7 @@ impl WorkerClient {
 #[derive(Debug, Clone)]
 pub struct DistributedExecutor {
     workers: Vec<WorkerClient>,
+    registry: WorkerRegistry,
     max_attempts: usize,
 }
 
@@ -130,8 +134,11 @@ impl DistributedExecutor {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let workers = addresses.into_iter().map(WorkerClient::new).collect::<Vec<_>>();
+        let registry = WorkerRegistry::new(workers.iter().map(|worker| worker.address.clone()));
         Self {
-            workers: addresses.into_iter().map(WorkerClient::new).collect(),
+            workers,
+            registry,
             max_attempts: 1,
         }
     }
@@ -145,7 +152,11 @@ impl DistributedExecutor {
         self.workers.len()
     }
 
-    pub fn execute(&self, graph: &mut TaskGraph) -> Result<Vec<TaskId>, CoordinatorError> {
+    pub fn healthy_worker_count(&self) -> usize {
+        self.registry.healthy_workers().len()
+    }
+
+    pub fn execute(&mut self, graph: &mut TaskGraph) -> Result<Vec<TaskId>, CoordinatorError> {
         if self.workers.is_empty() {
             return Err(CoordinatorError::NoWorkers);
         }
@@ -154,7 +165,15 @@ impl DistributedExecutor {
         let mut attempts = BTreeMap::<TaskId, usize>::new();
         let mut worker_index = 0usize;
 
+        self.registry.probe();
+
         loop {
+            self.registry.refresh_health();
+            let healthy_workers = self.registry.healthy_workers();
+            if healthy_workers.is_empty() {
+                return Err(CoordinatorError::NoHealthyWorkers);
+            }
+
             graph.reconcile_blocked();
             let runnable = graph.runnable();
 
@@ -168,7 +187,7 @@ impl DistributedExecutor {
             let assignments = runnable
                 .into_iter()
                 .map(|task_id| {
-                    let worker = self.workers[worker_index % self.workers.len()].clone();
+                    let worker = healthy_workers[worker_index % healthy_workers.len()].clone();
                     worker_index += 1;
                     let command = graph
                         .task(task_id)
@@ -253,17 +272,29 @@ mod tests {
 
     #[test]
     fn distributed_executor_runs_dependency_order() {
-        let (address, worker_thread) = spawn_worker(Worker::new("graph-worker", 2), 2);
+        let (address, worker_thread) = spawn_worker(Worker::new("graph-worker", 2), 4);
         let mut graph = TaskGraph::default();
         graph.add_task(1, "echo build", Vec::new()).unwrap();
         graph.add_task(2, "echo test", vec![1]).unwrap();
 
-        let executor = DistributedExecutor::new([address]);
+        let mut executor = DistributedExecutor::new([address]);
         let completed = executor.execute(&mut graph).unwrap();
 
         assert_eq!(completed, vec![1, 2]);
+        assert_eq!(executor.healthy_worker_count(), 1);
         assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
         assert_eq!(graph.task(2).unwrap().state, TaskState::Succeeded);
         worker_thread.join().unwrap();
+    }
+
+    #[test]
+    fn distributed_executor_rejects_only_unhealthy_workers() {
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, "echo never-runs", Vec::new()).unwrap();
+
+        let mut executor = DistributedExecutor::new(["127.0.0.1:1"]);
+        let error = executor.execute(&mut graph).unwrap_err();
+        assert!(matches!(error, CoordinatorError::NoHealthyWorkers));
+        assert_eq!(graph.task(1).unwrap().state, TaskState::Pending);
     }
 }
