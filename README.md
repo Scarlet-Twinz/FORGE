@@ -1,8 +1,8 @@
 # FORGE
 
-A systems-oriented distributed build and task execution engine.
+**Distributed build and task execution engine.**
 
-FORGE models dependency-aware workloads, schedules executable tasks, coordinates workers over a framed TCP protocol, persists execution state, and records deterministic results. The project is designed as infrastructure rather than a conventional web application.
+FORGE is a Rust-based execution system for dependency-aware workloads. It models tasks as a DAG, schedules runnable work, coordinates workers over TCP, persists execution state, handles worker and task failures, and provides artifact, cache, journal, and metrics primitives.
 
 ## Architecture
 
@@ -10,10 +10,10 @@ FORGE models dependency-aware workloads, schedules executable tasks, coordinates
 Client / CLI
      |
      v
- Job Definition
+ Task Graph
      |
      v
-  Distributed Scheduler
+ Coordinator
      |
      +-------------------+
      |                   |
@@ -23,129 +23,200 @@ Worker A              Worker B
      +---------+---------+
                |
                v
-         Results / Store
+        Store / Artifacts
+               |
+          +----+----+
+          |         |
+          v         v
+        Cache     Journal
+          |         |
+          +----+----+
                |
                v
-        Artifact / Cache
-               |
-               v
-        Execution Journal
-               |
-               v
-        Metrics / Telemetry
+            Metrics
 ```
 
-## Current Implementation
+## Features
 
-- **Task graph** — dependency-aware tasks with deterministic ordering and blocked-dependency propagation.
-- **Local scheduler** — deterministic runnable-task dispatch.
-- **Distributed executor** — executes runnable DAG tasks through remote workers and advances the graph only after task results are received.
-- **Worker health registry** — probes configured workers with heartbeats, records worker identity and last-seen time, expires stale workers, and prevents unhealthy workers from receiving scheduled work.
-- **Retry policy** — configurable maximum task attempts for failed commands, task timeouts, or worker communication failures.
-- **Task timeouts** — coordinator-configured execution deadlines are carried over the wire to workers and enforced at the child-process boundary.
-- **Timeout cancellation** — a worker terminates an over-deadline child process, returns an explicit timed-out result, releases its concurrency slot, and keeps the worker itself healthy.
-- **Worker runtime** — executes tasks as isolated child processes with a shared concurrency limit across worker connection threads.
-- **Wire protocol** — versioned binary frames with structured task requests, task results, timeout metadata, and heartbeats.
-- **TCP worker service** — workers accept concurrent task connections over localhost/network TCP.
-- **Coordinator client** — submits tasks to remote workers, validates returned results, and probes worker heartbeats.
-- **Persistence** — atomic file-backed job records that survive process reopen.
-- **Artifact store** — content-addressed binary artifacts keyed by SHA-256, stored atomically and deduplicated by content.
-- **Cache index** — persistent task/cache-key to artifact-hash mappings with deterministic on-disk ordering and validation of stored hashes.
-- **Execution cache** — cache-aware distributed execution can satisfy previously successful tasks without contacting a worker when the command and timeout identity match and the backing artifact still exists.
-- **Execution journal** — append-only, fsynced task lifecycle records can be replayed after process reopen; the journaled coordinator writes task-start records before distributed execution and terminal records after execution completes.
-- **Metrics layer** — records execution count, task success/failure/block counts, execution duration, configured workers, and the latest healthy-worker count; exposes deterministic Prometheus-style text for scraping or diagnostics.
-- **CLI** — local execution path plus a coordinator executable for remote worker execution.
+### Task graph and scheduling
 
-## Artifact and Cache Model
+- Dependency-aware task graph
+- Explicit task lifecycle states
+- Deterministic task ordering
+- Runnable-task scheduling with `VecDeque`
+- Blocked-dependency propagation
+- Cycle detection in the graph implementation
 
-FORGE separates immutable artifact data from cache metadata:
+### Distributed execution
+
+- Coordinator-to-worker execution over TCP
+- Dependency-aware distributed DAG execution
+- Worker registration and heartbeat probing
+- Stale-worker detection
+- Round-robin selection across healthy workers
+- Configurable task retry attempts
+- Worker communication failure handling
+- Command failure handling without unnecessarily ejecting a healthy worker
+
+### Worker runtime
+
+- Child-process task execution
+- Shared concurrency limits across connection threads
+- Per-task execution timeouts
+- Timeout cancellation at the process boundary
+- Explicit task-result reporting with exit code, stdout, stderr, and timeout state
+- Concurrent TCP connections
+
+### Wire protocol
+
+FORGE uses a versioned binary framing protocol between the coordinator and workers.
 
 ```text
-Task identity
++--------+---------+------+----------------+
+| MAGIC  | VERSION | KIND | PAYLOAD LENGTH |
++--------+---------+------+----------------+
+                         |
+                         v
+                      PAYLOAD
+```
+
+The protocol validates magic bytes, protocol versions, message kinds, payload sizes, UTF-8 data, and exact payload consumption. Task requests carry timeout metadata; task results carry execution outcome and process output; heartbeat messages identify workers and provide liveness information.
+
+### Persistence and storage
+
+- Atomic file-backed job records
+- Reopen and recover persisted job state
+- Content-addressed binary artifact storage
+- SHA-256 artifact identities
+- Atomic artifact writes and content deduplication
+- Persistent cache-key to artifact-hash index
+- Deterministic cache index ordering
+- Append-only execution journal with fsynced records
+- Journal replay with record validation
+
+### Cache
+
+The cache layer derives a deterministic key from the task command and configured timeout, then maps that key to a content-addressed artifact.
+
+```text
+Task command + timeout
+          |
+          v
+       SHA-256
+          |
+          v
+      CacheStore
+          |
+          v
+     artifact hash
+          |
+          v
+    ArtifactStore
+```
+
+A cache hit can satisfy a previously successful task without contacting a worker when the cache entry and referenced artifact are still present. The current cache artifact is a cache stamp derived from the task command; it does not yet restore the task's original stdout/stderr.
+
+### Execution journal
+
+The journal provides an append-only durability primitive for task lifecycle boundaries.
+
+```text
+TaskStarted
      |
      v
-   SHA-256
+execution
      |
-     v
- CacheStore ──────> task-key -> artifact-hash
-                           |
-                           v
-                    ArtifactStore
-                           |
-                           v
-                    objects/<hash>
+     +------> TaskSucceeded
+     |
+     +------> TaskFailed
 ```
 
-A cache entry is valid only while its referenced content-addressed object exists. Cache identity currently includes the command and configured task timeout, giving the execution cache a deterministic versioned key. The cache layer is deliberately separate from the core scheduler so storage policy can evolve without coupling the task graph to filesystem details.
+Journal appends use `sync_data()` before returning, and records can be replayed after reopening the journal. The journaled coordinator records lifecycle boundaries around distributed execution. It is not a complete crash-recovery state machine.
 
-## Execution Journal
+### Metrics
 
-The journal is an append-only durability primitive separate from the snapshot-style job store:
+The metrics layer records execution count, task outcomes, execution duration, configured workers, and the latest healthy-worker count. It renders deterministic Prometheus-style text for scraping or diagnostics.
 
-```text
-Coordinator
-    |
-    +--> TaskStarted --------> journal.log (fsync)
-    |
-    +--> distributed execution
-    |
-    +--> TaskSucceeded/Failed -> journal.log (fsync)
-                                  |
-                                  v
-                               replay()
-```
-
-Journal records are encoded as validated, tab-separated events. Worker addresses are escaped, malformed event records are rejected during replay, and every append is flushed through `sync_data()` before it is considered durable. The current journaled executor records lifecycle boundaries; it is not yet a full crash-recovery state machine or replacement for the existing job snapshot store.
-
-## Metrics
-
-The metrics layer wraps distributed execution without changing scheduler or worker behavior:
-
-```text
-Distributed Executor
-        |
-        v
-  MetricsSnapshot
-        |
-        +--> execution counters
-        +--> task outcome counters
-        +--> duration totals/last duration
-        +--> worker health snapshot
-        |
-        v
- Prometheus-style text
-```
-
-Metrics are deliberately dependency-light and deterministic. They are intended as a foundation for later runtime telemetry rather than a full Prometheus server.
-
-## Engineering Direction
-
-The system is built from the execution layer upward. Correctness, deterministic scheduling, explicit state transitions, protocol validation, process isolation, concurrency control, and failure handling take priority over presentation.
-
-The distributed layer is intentionally built in validated increments. The current implementation has a real coordinator-to-worker TCP path, heartbeat-based worker health, concurrent worker connections, dependency-aware distributed execution, configurable retries, timeout-triggered process termination, content-addressed artifact storage, a persistent cache index, cache-aware distributed execution, a durable execution-journal foundation, and an execution metrics layer. Benchmarks, fault-injection scenarios, richer CLI commands, explicit user cancellation messages, and a full crash-recovery state machine remain separate engineering layers and will be added only when implemented and tested.
+It is a metrics layer, not a Prometheus server.
 
 ## Repository Structure
 
 ```text
-forge/
+FORGE/
 ├── crates/
-│   ├── forge-core/        # Task graph, scheduler, state machine
-│   ├── forge-worker/      # Worker execution runtime + TCP service
-│   ├── forge-protocol/    # Versioned client/worker wire protocol
-│   ├── forge-store/       # Persistent state, artifacts, cache index, journal
-│   ├── forge-coordinator/ # Distributed worker client + DAG executor
+│   ├── forge-core/        # Task graph, scheduler, task states
+│   ├── forge-worker/      # Task execution runtime and TCP worker
+│   ├── forge-protocol/    # Binary coordinator/worker protocol
+│   ├── forge-store/       # Job state, artifacts, cache index, journal
+│   ├── forge-cli/         # Local execution CLI
+│   ├── forge-coordinator/ # Distributed execution and worker health
 │   ├── forge-cache/       # Cache-aware distributed execution
-│   ├── forge-metrics/     # Execution metrics + Prometheus-style rendering
-│   └── forge-cli/         # Local execution CLI
-├── tests/                 # Integration and fault tests
-├── benches/               # Performance benchmarks
-├── docs/                  # Architecture and protocol notes
+│   └── forge-metrics/     # Execution metrics and text rendering
+├── Cargo.toml
 └── README.md
 ```
 
-## Status
+## Getting Started
 
-The execution core, local scheduling, persistence foundation, binary protocol, concurrent TCP workers, heartbeat-based worker health, distributed DAG execution, retry foundation, timeout-triggered process cancellation, content-addressed artifact storage, persistent cache index, cache-aware distributed execution, execution-journal foundation, and metrics foundation are implemented and tested. The project remains under active systems-engineering development and is intentionally focused on infrastructure depth rather than a web frontend.
+### Prerequisites
+
+- Rust toolchain with Cargo
+
+Verify the installation:
+
+```bash
+rustc --version
+cargo --version
+```
+
+### Clone
+
+```bash
+git clone https://github.com/Scarlet-Twinz/FORGE.git
+cd FORGE
+```
+
+### Run the local CLI
+
+```bash
+cargo run -p forge-cli
+```
+
+The current CLI executes a small dependency chain locally and persists job state under the system temporary directory.
+
+### Run the tests
+
+```bash
+cargo test --workspace
+```
+
+The workspace includes unit and integration-oriented coverage across task scheduling, protocol encoding/decoding, worker execution, timeout handling, worker health, retries, persistence, artifact storage, caching, journaling, and metrics.
+
+## Engineering Notes
+
+FORGE is structured as a Cargo workspace so the execution model, worker runtime, protocol, persistence layer, coordinator, cache, metrics, and CLI can evolve independently.
+
+The implementation emphasizes deterministic behavior and explicit failure handling. Worker communication failures are treated differently from command failures: communication failures can make a worker unhealthy, while a normal task failure does not automatically remove a responsive worker from the registry.
+
+Timeouts are carried from the coordinator through the wire protocol to the worker, where the child process is terminated when the execution deadline is reached. On Windows, process-tree termination is used so child processes do not remain attached to the worker's pipes.
+
+## Current State
+
+The core execution path is implemented and tested, including:
+
+- task graph and scheduling;
+- distributed worker execution;
+- worker health and heartbeats;
+- retries and task timeouts;
+- binary TCP protocol;
+- persistent job state;
+- content-addressed artifacts;
+- persistent cache indexing;
+- execution journaling;
+- execution metrics;
+- local CLI execution.
+
+The remaining larger engineering layers are separate from the current implementation: richer CLI commands, benchmark suites, fault-injection scenarios, full crash recovery, and caching/restoration of actual task output.
 
 ## License
 
