@@ -12,24 +12,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_path = std::env::temp_dir().join("forge-jobs.db");
     let mut store = JobStore::open(store_path)?;
 
-    scheduler.refresh(&graph);
-    while let Some(task_id) = scheduler.next() {
-        let command = graph.task(task_id).expect("scheduled task disappeared").command.clone();
-        graph.task_mut(task_id).expect("task disappeared").state = TaskState::Running;
+    loop {
+        scheduler.refresh(&graph);
+        let Some(task_id) = scheduler.next() else {
+            break;
+        };
+
+        let command = graph
+            .task(task_id)
+            .expect("scheduled task disappeared")
+            .command
+            .clone();
+
+        graph
+            .task_mut(task_id)
+            .expect("task disappeared")
+            .state = TaskState::Running;
+
         let result = worker.execute(&command)?;
-        let state = if result.success { TaskState::Succeeded } else { TaskState::Failed };
-        graph.task_mut(task_id).expect("task disappeared").state = state;
+        let state = if result.success {
+            TaskState::Succeeded
+        } else {
+            TaskState::Failed
+        };
+
+        graph
+            .task_mut(task_id)
+            .expect("task disappeared")
+            .state = state;
+
         store.upsert(JobRecord {
             job_id: task_id,
             status: format!("{:?}", state).to_lowercase(),
         })?;
-        println!("task={task_id} worker={} state={state:?} duration={:?}", worker.id, result.duration);
-    }
 
-    scheduler.refresh(&graph);
-    if let Some(task_id) = scheduler.next() {
-        eprintln!("unexpected runnable task: {task_id}");
-        std::process::exit(1);
+        println!(
+            "task={task_id} worker={} state={state:?} duration={:?}",
+            worker.id, result.duration
+        );
+
+        if state == TaskState::Failed {
+            eprintln!("task {task_id} failed; dependent work will not run");
+            std::process::exit(1);
+        }
     }
 
     println!("FORGE local execution complete");
