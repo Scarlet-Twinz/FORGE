@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -118,6 +119,7 @@ impl WorkerClient {
 #[derive(Debug, Clone)]
 pub struct DistributedExecutor {
     workers: Vec<WorkerClient>,
+    max_attempts: usize,
 }
 
 impl DistributedExecutor {
@@ -128,7 +130,13 @@ impl DistributedExecutor {
     {
         Self {
             workers: addresses.into_iter().map(WorkerClient::new).collect(),
+            max_attempts: 1,
         }
+    }
+
+    pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
     }
 
     pub fn worker_count(&self) -> usize {
@@ -141,6 +149,7 @@ impl DistributedExecutor {
         }
 
         let mut completed = Vec::new();
+        let mut attempts = BTreeMap::<TaskId, usize>::new();
         let mut worker_index = 0usize;
 
         loop {
@@ -165,6 +174,8 @@ impl DistributedExecutor {
                         .command
                         .clone();
                     graph.task_mut(task_id).expect("runnable task must exist").state = TaskState::Running;
+                    let attempt = attempts.entry(task_id).or_insert(0);
+                    *attempt += 1;
                     (task_id, worker, command)
                 })
                 .collect::<Vec<_>>();
@@ -186,7 +197,12 @@ impl DistributedExecutor {
                         completed.push(task_id);
                     }
                     Ok(_) | Err(_) => {
-                        graph.task_mut(task_id).expect("running task must exist").state = TaskState::Failed;
+                        let attempt = attempts.get(&task_id).copied().unwrap_or(1);
+                        if attempt < self.max_attempts {
+                            graph.task_mut(task_id).expect("running task must exist").state = TaskState::Pending;
+                        } else {
+                            graph.task_mut(task_id).expect("running task must exist").state = TaskState::Failed;
+                        }
                     }
                 }
             }
@@ -228,6 +244,22 @@ mod tests {
         let heartbeat = WorkerClient::new(address).heartbeat().unwrap();
         assert_eq!(heartbeat.worker_id, "heartbeat-worker");
         assert!(heartbeat.unix_seconds > 0);
+        worker_thread.join().unwrap();
+    }
+
+    #[test]
+    fn distributed_executor_runs_dependency_order() {
+        let (address, worker_thread) = spawn_worker_once(Worker::new("graph-worker", 2));
+        let mut graph = TaskGraph::default();
+        graph.add_task(1, "echo build", Vec::new()).unwrap();
+        graph.add_task(2, "echo test", vec![1]).unwrap();
+
+        let executor = DistributedExecutor::new([address]);
+        let completed = executor.execute(&mut graph).unwrap();
+
+        assert_eq!(completed, vec![1, 2]);
+        assert_eq!(graph.task(1).unwrap().state, TaskState::Succeeded);
+        assert_eq!(graph.task(2).unwrap().state, TaskState::Succeeded);
         worker_thread.join().unwrap();
     }
 }
