@@ -1,0 +1,9 @@
+[package]
+name = "forge-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-worker = { path = "../forge-worker" }
+forge-store = { path = "../forge-store" }
