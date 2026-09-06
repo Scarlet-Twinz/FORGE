@@ -11,7 +11,7 @@ use forge_protocol::{Frame, Heartbeat, MessageKind, TaskRequest, TaskResult};
 #[derive(Debug)]
 pub enum CoordinatorError {
     Io(std::io::Error),
-    Protocol(Box<dyn std::error::Error>),
+    Protocol(String),
     UnexpectedMessage(MessageKind),
     NoWorkers,
     SchedulerStalled,
@@ -74,7 +74,7 @@ impl WorkerClient {
         };
         let payload = request
             .encode()
-            .map_err(|error| CoordinatorError::Protocol(Box::new(error)))?;
+            .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
         Frame {
             kind: MessageKind::TaskRequest,
             payload,
@@ -83,12 +83,12 @@ impl WorkerClient {
         stream.flush()?;
 
         let response = Frame::decode(&mut stream)
-            .map_err(CoordinatorError::Protocol)?;
+            .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
         if response.kind != MessageKind::TaskResult {
             return Err(CoordinatorError::UnexpectedMessage(response.kind));
         }
         TaskResult::decode(&response.payload)
-            .map_err(|error| CoordinatorError::Protocol(Box::new(error)))
+            .map_err(|error| CoordinatorError::Protocol(error.to_string()))
     }
 
     pub fn heartbeat(&self) -> Result<Heartbeat, CoordinatorError> {
@@ -98,7 +98,7 @@ impl WorkerClient {
             unix_seconds: 0,
         }
         .encode()
-        .map_err(|error| CoordinatorError::Protocol(Box::new(error)))?;
+        .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
         Frame {
             kind: MessageKind::Heartbeat,
             payload,
@@ -107,12 +107,12 @@ impl WorkerClient {
         stream.flush()?;
 
         let response = Frame::decode(&mut stream)
-            .map_err(CoordinatorError::Protocol)?;
+            .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
         if response.kind != MessageKind::Heartbeat {
             return Err(CoordinatorError::UnexpectedMessage(response.kind));
         }
         Heartbeat::decode(&response.payload)
-            .map_err(|error| CoordinatorError::Protocol(Box::new(error)))
+            .map_err(|error| CoordinatorError::Protocol(error.to_string()))
     }
 }
 
