@@ -143,7 +143,7 @@ mod tests {
     fn cached_execution_skips_worker_on_second_run() {
         let root = std::env::temp_dir().join(format!("forge-cache-exec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let (address, worker_thread) = spawn_worker(Worker::new("cache-worker", 1), 1);
+        let (address, worker_thread) = spawn_worker(Worker::new("cache-worker", 1), 2);
 
         let mut first_graph = TaskGraph::default();
         first_graph.add_task(1, "echo cache-me", Vec::new()).unwrap();
