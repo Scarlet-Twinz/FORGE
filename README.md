@@ -162,21 +162,9 @@ Implemented: task graph/scheduling, distributed worker execution, worker health/
 
 Separate future layers include richer CLI commands, benchmark/fault-injection suites, full crash recovery, and restoration of actual task output from the cache.
 
+
 ## License
 
-MIT
+MIT License.
 
-
-The README emphasizes the actual execution model and reliability boundaries so the distributed-system design can be reviewed directly from the repository.
-
-## Author
-
-**Anthony Emmanuella Mmasinachi**
-
-Full-stack and systems engineer focused on distributed systems, backend infrastructure, networking, databases, AI integration, and systems programming.
-
-## Project Links
-
-- **Repository:** https://github.com/Scarlet-Twinz/FORGE
-- **Author:** Anthony Emmanuella Mmasinachi
-- **GitHub:** https://github.com/Scarlet-Twinz
+See [LICENSE](LICENSE) for the full license text.
